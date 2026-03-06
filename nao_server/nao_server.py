@@ -19,11 +19,18 @@ class NaoBridge:
         print("NAO is initialized and listening for commands on port 8000.")
 
     def play_trajectory(self, names, angles, times):
-        """Receives trajectory arrays from Python 3 and executes them."""
+        """Receives trajectory arrays from Python 3 and executes them ASYNCHRONOUSLY."""
         print("Received trajectory payload for {} joints. Executing...".format(len(names)))
-        # The 'True' flag means these are absolute angles, not relative
-        self.motion.angleInterpolation(names, angles, times, True)
-        print("Trajectory complete.")
+        
+        # Adding '.post' makes this a background task. It returns immediately!
+        self.motion.post.angleInterpolation(names, angles, times, True)
+        return True
+
+    def stop(self):
+        """Emergency stop command triggered by Ctrl+C"""
+        print("\nEMERGENCY STOP RECEIVED!")
+        self.motion.killAll() # Instantly kills all running motion tasks
+        self.posture.goToPosture("StandInit", 0.5) # Safely return to starting pose
         return True
     
     def rest(self):

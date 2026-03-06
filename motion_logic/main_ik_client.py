@@ -235,11 +235,27 @@ def main():
             
         current_time += time_delta
 
-    print("Sending trajectory payload to Python 2 Server. Robot should start moving...")
+    # Find out exactly how long the animation takes
+    total_duration = max([t[-1] for t in times if t])
+
+    print(f"Sending trajectory payload. Animation will run for {total_duration:.1f} seconds.")
     nao.play_trajectory(joint_names, angles, times)
 
-    print("Animation complete. Putting robot to rest.")
-    nao.rest()
+    # Because the robot is now moving in the background, we must keep Python 3 
+    # alive for the duration of the animation so it can listen for your Ctrl+C
+    import time
+    try:
+        print("Robot is moving! Press Ctrl+C at any time to abort...")
+        time.sleep(total_duration)
+        
+        # If it finishes naturally without you pressing Ctrl+C:
+        print("Animation complete. Putting robot to rest.")
+        nao.rest()
+
+    except KeyboardInterrupt:
+        # If you press Ctrl+C, this block catches it and sends the stop command!
+        print("\n[!] Ctrl+C detected! Aborting robot motion...")
+        nao.stop()
 
 if __name__ == "__main__":
     main()
