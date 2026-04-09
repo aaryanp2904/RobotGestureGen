@@ -2,6 +2,7 @@
 from SimpleXMLRPCServer import SimpleXMLRPCServer
 from naoqi import ALProxy
 import sys
+import time
 
 class NaoBridge:
     def __init__(self, robot_ip, robot_port):
@@ -9,7 +10,7 @@ class NaoBridge:
         self.motion = ALProxy("ALMotion", robot_ip, robot_port)
         self.posture = ALProxy("ALRobotPosture", robot_ip, robot_port)
         self.life = ALProxy("ALAutonomousLife", robot_ip, robot_port)
-
+        self.tts = ALProxy("ALTextToSpeech", robot_ip, robot_port)
         # Disable autonomous life to prevent it from interfering with our animation
         if self.life.getState() != "disabled":
             self.life.setState("disabled")
@@ -19,11 +20,22 @@ class NaoBridge:
         print("NAO is initialized and listening for commands on port 8000.")
 
     def play_trajectory(self, names, angles, times):
-        """Receives trajectory arrays from Python 3 and executes them ASYNCHRONOUSLY."""
+        """Receives trajectory arrays from Python 3 and executes them with BLOCKING call to simulator."""
         print("Received trajectory payload for {} joints. Executing...".format(len(names)))
+        self.tts.say("Starting motion")
         
-        # Adding '.post' makes this a background task. It returns immediately!
-        self.motion.post.angleInterpolation(names, angles, times, True)
+        # Record start time
+        start_time = time.time()
+        
+        # Blocking call to the simulator - this method returns only when the trajectory finishes
+        self.motion.angleInterpolation(names, angles, times, True)
+        
+        # Record end time and calculate elapsed duration
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        
+        self.tts.say("Ended motion")
+        print("Simulation execution time: {:.2f} seconds".format(elapsed_time))
         return True
 
     def stop(self):
