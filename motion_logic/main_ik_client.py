@@ -1,6 +1,10 @@
 # main_ik_client.py - RUN IN PYTHON 3
 import xmlrpc.client
 import math
+import threading
+import time
+import os
+import wave
 
 class BVHParser:
     def __init__(self, filepath):
@@ -187,6 +191,89 @@ def map_bvh_to_nao(bvh_frame, channels):
         "LElbowRoll":     clamp(l_er, -1.54, -0.03)
     }
 
+def get_wav_file(bvh_filepath):
+    """
+    Find the corresponding WAV file for a given BVH file.
+    
+    TODO: Implement this function to locate the audio file based on the BVH filepath.
+    For example, you could:
+    - Replace the extension: path.bvh -> path.wav
+    - Search in a specific directory based on the BVH name
+    - Check if the file exists before returning
+    
+    Args:
+        bvh_filepath (str): Path to the BVH file
+        
+    Returns:
+        str: Path to the corresponding WAV file, or None if not found
+    """
+
+    return r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\wav\trn_2022_v1_000.wav"
+    # Placeholder implementation - replace with your logic
+    wav_filepath = bvh_filepath.rsplit('.', 1)[0] + '.wav'
+    if os.path.exists(wav_filepath):
+        return wav_filepath
+    return None
+
+def play_audio_in_thread(wav_filepath):
+    """
+    Play a WAV file in a separate daemon thread without blocking the main thread.
+    
+    Args:
+        wav_filepath (str): Path to the WAV file to play
+    """
+    if wav_filepath is None:
+        print("[!] No audio file found, skipping audio playback.")
+        return
+    
+    if not os.path.exists(wav_filepath):
+        print(f"[!] Audio file not found: {wav_filepath}")
+        return
+    
+    def _play_audio():
+        try:
+            # Open and play the WAV file using the wave module
+            with wave.open(wav_filepath, 'rb') as wav_file:
+                import pyaudio
+                print("playing audio")
+                # Get audio parameters
+                n_channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                framerate = wav_file.getframerate()
+                
+                # Initialize PyAudio
+                p = pyaudio.PyAudio()
+                
+                # Open audio output stream
+                stream = p.open(format=p.get_format_from_width(sample_width),
+                                channels=n_channels,
+                                rate=framerate,
+                                output=True)
+                
+                # Read and play audio in chunks
+                chunk = 2048
+                while True:
+                    data = wav_file.readframes(chunk)
+                    if not data:
+                        break
+                    stream.write(data)
+                
+                # Clean up
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+                print("[✓] Audio playback completed.")
+                
+        except Exception as e:
+            print(f"[!] Error playing audio: {e}")
+
+        print("Finished playing audio")
+    
+    # Start audio playback in a daemon thread (won't block main thread)
+    audio_thread = threading.Thread(target=_play_audio, daemon=True)
+    audio_thread.start()
+    print(f"[♪] Audio playback started in background thread: {os.path.basename(wav_filepath)}")
+
 def main():
     print("Connecting to Python 2 NAO Bridge on localhost:8000...")
     try:
@@ -196,8 +283,8 @@ def main():
         return
 
     print("Loading BVH and computing IK in Python 3...")
-    bvh = BVHParser(r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\bvh\trn_2022_v1_000.bvh")
-    
+    bvh_filepath = r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\bvh\trn_2022_v1_000.bvh"
+    bvh = BVHParser(bvh_filepath)
     # Added Head Joints
     joint_names = [
         "HeadYaw", "HeadPitch",
@@ -239,14 +326,25 @@ def main():
     total_duration = max([t[-1] for t in times if t])
 
     print(f"Sending trajectory payload. Animation will run for {total_duration:.1f} seconds.")
-    nao.play_trajectory(joint_names, angles, times)
+    
+    # Execute the trajectory on the server as a separate thread
+    # The server will make a blocking call to the simulator, but we execute it in the background
+    trajectory_thread = threading.Thread(
+        target=nao.play_trajectory, 
+        args=(joint_names, angles, times),
+        daemon=False
+    )
+    trajectory_thread.start()
+    
+    # Find and play the corresponding audio file in a separate thread
+    wav_filepath = get_wav_file(bvh_filepath)
+    play_audio_in_thread(wav_filepath)
 
-    # Because the robot is now moving in the background, we must keep Python 3 
-    # alive for the duration of the animation so it can listen for your Ctrl+C
-    import time
+    # Because the trajectory is running in a background thread, we must keep Python 3 
+    # alive until it completes so it can listen for your Ctrl+C
     try:
         print("Robot is moving! Press Ctrl+C at any time to abort...")
-        time.sleep(total_duration)
+        trajectory_thread.join()  # Wait for the trajectory to complete
         
         # If it finishes naturally without you pressing Ctrl+C:
         print("Animation complete. Putting robot to rest.")
