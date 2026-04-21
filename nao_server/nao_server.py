@@ -1,9 +1,16 @@
 # nao_server.py - RUN IN PYTHON 2.7
 from SimpleXMLRPCServer import SimpleXMLRPCServer
+from SocketServer import ThreadingMixIn
 from naoqi import ALProxy
 import sys
 import time
 import threading
+import signal
+
+
+class ThreadingXMLRPCServer(ThreadingMixIn, SimpleXMLRPCServer):
+    """Multi-threaded XML-RPC server so stop() can be called during playback."""
+    daemon_threads = True
 
 class NaoBridge:
     def __init__(self, robot_ip, robot_port):
@@ -16,6 +23,7 @@ class NaoBridge:
         if self.life.getState() != "disabled":
             self.life.setState("disabled")
 
+        self._stop_flag = False
         self.motion.wakeUp()
         self.posture.goToPosture("StandInit", 0.5)
         print("NAO is initialized and listening for commands on port 8000.")
@@ -65,11 +73,17 @@ class NaoBridge:
             num_frames, all_times[0][-1], frame_dt))
 
         # --- Timed loop: setAngles per frame + speech ---
+        self._stop_flag = False
         speech_idx = 0
         overall_start = time.time()
         speed_fraction = 0.5  # fraction of max speed for setAngles (0.0-1.0)
 
         for frame_i in range(num_frames):
+            # Check stop flag each frame
+            if self._stop_flag:
+                print("Stop flag set - aborting playback at frame {}".format(frame_i))
+                break
+
             frame_abs_time = all_times[0][frame_i]
             target_wall = overall_start + frame_abs_time
 
@@ -122,15 +136,18 @@ class NaoBridge:
         return True
 
     def stop(self):
-        """Emergency stop command triggered by Ctrl+C"""
+        """Emergency stop - set flag, kill motion, reset robot to StandInit."""
         print("\nEMERGENCY STOP RECEIVED!")
+        self._stop_flag = True
         self.motion.killAll()
+        self.motion.wakeUp()
         self.posture.goToPosture("StandInit", 0.5)
         return True
 
     def rest(self):
         """Returns the robot to a resting state."""
         print("Returning to rest state.")
+        self.motion.wakeUp()
         self.posture.goToPosture("StandInit", 0.5)
         self.motion.rest()
         return True
@@ -139,12 +156,28 @@ if __name__ == "__main__":
     robot_port = int(sys.argv[1]) if len(sys.argv) > 1 else 31559
     robot_ip = "127.0.0.1"
 
-    server = SimpleXMLRPCServer(("localhost", 8000), allow_none=True)
+    server = ThreadingXMLRPCServer(("localhost", 8000), allow_none=True)
     server.register_introspection_functions()
-    server.register_instance(NaoBridge(robot_ip, robot_port))
+    bridge = NaoBridge(robot_ip, robot_port)
+    server.register_instance(bridge)
+
+    # Signal handler to set stop flag + kill motion on Ctrl+C
+    def signal_handler(sig, frame):
+        print("\nCtrl+C received. Stopping playback and resetting robot...")
+        bridge._stop_flag = True
+        try:
+            bridge.motion.killAll()
+        except Exception:
+            pass
+        try:
+            bridge.motion.wakeUp()
+            bridge.posture.goToPosture("StandInit", 0.5)
+        except Exception as e:
+            print("Error resetting robot: {}".format(str(e)))
+        print("Server shut down.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     print("Python 2 Bridge Server running. Waiting for Python 3 client...")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down server.")
+    server.serve_forever()

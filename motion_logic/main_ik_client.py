@@ -7,6 +7,14 @@ import os
 import wave
 import sys
 
+# ---- CHANGE THESE PATHS ----
+BVH_DIR = r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\bvh"
+TSV_DIR = r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\tsv"
+WAV_DIR = r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\wav"
+
+# Global flag to stop audio playback
+_audio_stop = False
+
 class BVHParser:
     def __init__(self, filepath):
         self.filepath = filepath
@@ -279,7 +287,9 @@ def play_audio_in_thread(wav_filepath):
         return
     
     def _play_audio():
+        global _audio_stop
         try:
+            time.sleep(1.5)
             # Open and play the WAV file using the wave module
             with wave.open(wav_filepath, 'rb') as wav_file:
                 import pyaudio
@@ -300,7 +310,7 @@ def play_audio_in_thread(wav_filepath):
                 
                 # Read and play audio in chunks
                 chunk = 2048
-                while True:
+                while not _audio_stop:
                     data = wav_file.readframes(chunk)
                     if not data:
                         break
@@ -310,13 +320,15 @@ def play_audio_in_thread(wav_filepath):
                 stream.stop_stream()
                 stream.close()
                 p.terminate()
-                print("[✓] Audio playback completed.")
+                if not _audio_stop:
+                    print("[✓] Audio playback completed.")
+                else:
+                    print("[✓] Audio playback stopped.")
                 
         except Exception as e:
             print(f"[!] Error playing audio: {e}")
-
-        print("Finished playing audio")
     
+    _audio_stop = False
     # Start audio playback in a daemon thread (won't block main thread)
     audio_thread = threading.Thread(target=_play_audio, daemon=True)
     audio_thread.start()
@@ -393,13 +405,22 @@ def build_full_payload(bvh, tsv, joint_names):
 
 def main():
     # Parse command line arguments
-    if len(sys.argv) < 3:
-        print("Usage: python main_ik_client.py <bvh_file> <tsv_file>")
-        print("Example: python main_ik_client.py motion.bvh speech.tsv")
+    if len(sys.argv) < 2:
+        print("Usage: python main_ik_client.py <filename>")
+        print("Example: python main_ik_client.py trn_2022_v1_000")
+        print("\nThe filename is used to find:")
+        print(f"  BVH: {{BVH_DIR}}/<filename>.bvh")
+        print(f"  TSV: {{TSV_DIR}}/<filename>.tsv")
+        print(f"  WAV: {{WAV_DIR}}/<filename>.wav")
         sys.exit(1)
     
-    bvh_filepath = sys.argv[1]
-    tsv_filepath = sys.argv[2]
+    filename = sys.argv[1]
+    # Strip extension if user accidentally included one
+    filename = os.path.splitext(filename)[0]
+    
+    bvh_filepath = os.path.join(BVH_DIR, filename + ".bvh")
+    tsv_filepath = os.path.join(TSV_DIR, filename + ".tsv")
+    wav_filepath = os.path.join(WAV_DIR, filename + ".wav")
     
     # Validate files exist
     if not os.path.exists(bvh_filepath):
@@ -408,6 +429,10 @@ def main():
     if not os.path.exists(tsv_filepath):
         print(f"[!] TSV file not found: {tsv_filepath}")
         sys.exit(1)
+    if not os.path.exists(wav_filepath):
+        print(f"[!] WAV file not found: {wav_filepath}")
+        print("    (Audio will be skipped)")
+        wav_filepath = None
     
     print("Connecting to Python 2 NAO Bridge on localhost:8000...")
     try:
@@ -434,23 +459,47 @@ def main():
     all_times, all_angles, frame_texts = build_full_payload(bvh, tsv, joint_names)
     
     # Send everything in ONE XML-RPC call — server handles streaming
+    print("[→] Sending full payload to NAO server (one RPC call)...")
+    print("[⏳] Server is now streaming motion + speech to the robot...\n")
+    
+    # Start audio playback in background right as motion begins
+    if wav_filepath:
+        play_audio_in_thread(wav_filepath)
+    
+    # Run the RPC call in a background thread so the main thread
+    # stays responsive to Ctrl+C (Windows blocks KeyboardInterrupt
+    # during C-level socket reads)
+    rpc_error = [None]
+    def rpc_call():
+        try:
+            nao.play_motion_with_speech(joint_names, all_angles, all_times, frame_texts)
+        except Exception as e:
+            rpc_error[0] = e
+    
+    rpc_thread = threading.Thread(target=rpc_call)
+    rpc_thread.daemon = True
+    rpc_thread.start()
+    
     try:
-        print("[→] Sending full payload to NAO server (one RPC call)...")
-        print("[⏳] Server is now streaming motion + speech to the robot...\n")
-        nao.play_motion_with_speech(joint_names, all_angles, all_times, frame_texts)
+        # Poll with short timeout so Ctrl+C can be caught
+        while rpc_thread.is_alive():
+            rpc_thread.join(timeout=0.5)
         
-        print("\n[✓] Animation complete. Putting robot to rest.")
-        nao.rest()
+        if rpc_error[0]:
+            print(f"\n[!] Error during playback: {rpc_error[0]}")
+        else:
+            print("\n[✓] Animation complete. Putting robot to rest.")
+            nao.rest()
 
     except KeyboardInterrupt:
-        print("\n[!] Ctrl+C detected! Aborting robot motion...")
-        nao.stop()
-    except Exception as e:
-        print(f"\n[!] Error during playback: {e}")
+        print("\n[!] Ctrl+C detected! Stopping audio and aborting robot motion...")
+        _audio_stop = True
         try:
-            nao.stop()
-        except:
-            pass
+            # Create a FRESH connection since the original one may be broken
+            nao2 = xmlrpc.client.ServerProxy('http://localhost:8000', allow_none=True)
+            nao2.stop()
+        except Exception as e:
+            print(f"[!] Could not send stop to server: {e}")
 
 if __name__ == "__main__":
     main()
