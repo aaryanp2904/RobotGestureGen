@@ -5,6 +5,7 @@ import threading
 import time
 import os
 import wave
+import sys
 
 class BVHParser:
     def __init__(self, filepath):
@@ -45,8 +46,55 @@ class BVHParser:
                     self.joint_channels[current_joint] = list(range(channel_index, channel_index + num_channels))
                     channel_index += num_channels
             else:
-                if parts[0] not in ["Frames:", "Frame"]:
+                if parts[0] == "Frames:":
+                    continue
+                elif parts[0] == "Frame" and len(parts) >= 3 and parts[1] == "Time:":
+                    self.frame_time = float(parts[2])
+                else:
                     self.frames.append([float(x) for x in parts])
+
+class TSVParser:
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.entries = []
+        self.parse()
+    
+    def parse(self):
+        """Parse TSV file with format: start_time<TAB>end_time<TAB>text"""
+        with open(self.filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 3:
+                    try:
+                        start_time = float(parts[0])
+                        end_time = float(parts[1])
+                        text = parts[2]
+                        self.entries.append({
+                            'start': start_time,
+                            'end': end_time,
+                            'text': text
+                        })
+                    except ValueError:
+                        print(f"[!] Skipping malformed TSV line: {line}")
+                        continue
+        
+        # Sort by start time
+        self.entries.sort(key=lambda x: x['start'])
+        print(f"[✓] Loaded {len(self.entries)} speech entries from TSV.")
+    
+    def get_text_for_frame_time(self, current_time):
+        """
+        Get the speech text active at the given time.
+        Returns the text string if a word's [start, end) interval covers current_time,
+        or empty string if silence.
+        """
+        for entry in self.entries:
+            if entry['start'] <= current_time < entry['end']:
+                return entry['text']
+        return ""
 
 # --- Vector & Matrix Math for Kinematics ---
 
@@ -274,7 +322,93 @@ def play_audio_in_thread(wav_filepath):
     audio_thread.start()
     print(f"[♪] Audio playback started in background thread: {os.path.basename(wav_filepath)}")
 
+def build_full_payload(bvh, tsv, joint_names):
+    """
+    Pre-compute ALL frame kinematics and attach per-frame speech text.
+    Returns a payload ready to be sent in one XML-RPC call to the server.
+    
+    Each frame gets the speech text whose [start, end) interval covers
+    the frame's timestamp. Empty string means silence at that frame.
+    """
+    time_delta = bvh.frame_time  # use native BVH frame rate (30fps)
+    
+    print(f"[→] Pre-computing all frame kinematics ({1.0/time_delta:.0f} fps)...")
+    
+    # Per-joint lists for angleInterpolation format
+    all_times = [[] for _ in joint_names]
+    all_angles = [[] for _ in joint_names]
+    frame_texts = []
+    
+    # NAO per-joint max velocities (rad/s) — set to 80% of hardware max for safety
+    nao_max_velocities = {
+        "HeadYaw":        8.27 * 0.8,   # max 8.27
+        "HeadPitch":      7.19 * 0.8,   # max 7.19
+        "RShoulderPitch": 8.27 * 0.8,
+        "RShoulderRoll":  7.19 * 0.8,   # max 7.19
+        "RElbowYaw":      8.27 * 0.8,
+        "RElbowRoll":     8.27 * 0.8,
+        "LShoulderPitch": 8.27 * 0.8,
+        "LShoulderRoll":  7.19 * 0.8,
+        "LElbowYaw":      8.27 * 0.8,
+        "LElbowRoll":     8.27 * 0.8,
+    }
+    
+    # Start at one frame_time so first keyframe time is always > 0
+    current_time = time_delta
+    last_angles = [None] * len(joint_names)
+    
+    for i in range(len(bvh.frames)):
+        frame_data = bvh.frames[i]
+        mapped = map_bvh_to_nao(frame_data, bvh.joint_channels)
+        
+        # Apply per-joint speed limiting using NAO hardware velocity limits
+        for j, name in enumerate(joint_names):
+            max_vel = nao_max_velocities.get(name, 5.0)
+            if last_angles[j] is not None:
+                max_change = max_vel * time_delta
+                diff = mapped[name] - last_angles[j]
+                if abs(diff) > max_change:
+                    mapped[name] = last_angles[j] + math.copysign(max_change, diff)
+            last_angles[j] = mapped[name]
+        
+        # Build trajectory arrays
+        for j, name in enumerate(joint_names):
+            all_times[j].append(current_time)
+            all_angles[j].append(mapped[name])
+        
+        # Attach speech text active at this frame's time
+        text = tsv.get_text_for_frame_time(current_time)
+        frame_texts.append(text)
+        
+        current_time += time_delta
+    
+    total_frames = len(frame_texts)
+    total_duration = all_times[0][-1] if total_frames > 0 else 0
+    speech_frames = sum(1 for t in frame_texts if t)
+    
+    print(f"[✓] Pre-computed {total_frames} frames. Total duration: {total_duration:.1f}s")
+    print(f"[✓] {speech_frames} frames have speech text attached.\n")
+    
+    return all_times, all_angles, frame_texts
+
 def main():
+    # Parse command line arguments
+    if len(sys.argv) < 3:
+        print("Usage: python main_ik_client.py <bvh_file> <tsv_file>")
+        print("Example: python main_ik_client.py motion.bvh speech.tsv")
+        sys.exit(1)
+    
+    bvh_filepath = sys.argv[1]
+    tsv_filepath = sys.argv[2]
+    
+    # Validate files exist
+    if not os.path.exists(bvh_filepath):
+        print(f"[!] BVH file not found: {bvh_filepath}")
+        sys.exit(1)
+    if not os.path.exists(tsv_filepath):
+        print(f"[!] TSV file not found: {tsv_filepath}")
+        sys.exit(1)
+    
     print("Connecting to Python 2 NAO Bridge on localhost:8000...")
     try:
         nao = xmlrpc.client.ServerProxy('http://localhost:8000', allow_none=True)
@@ -282,78 +416,41 @@ def main():
         print("ERROR: Could not connect to the Python 2 Server. Is nao_server.py running?")
         return
 
-    print("Loading BVH and computing IK in Python 3...")
-    bvh_filepath = r"C:\Users\aarya\Documents\Imperial College London\Year 4\FYP\Datasets\Genea2022\trn\trn\bvh\trn_2022_v1_000.bvh"
+    print(f"Loading BVH: {os.path.basename(bvh_filepath)}")
     bvh = BVHParser(bvh_filepath)
-    # Added Head Joints
+    
+    print(f"Loading TSV: {os.path.basename(tsv_filepath)}")
+    tsv = TSVParser(tsv_filepath)
+    
+    # Joint names for NAO
     joint_names = [
         "HeadYaw", "HeadPitch",
         "RShoulderPitch", "RShoulderRoll", "RElbowYaw", "RElbowRoll",
         "LShoulderPitch", "LShoulderRoll", "LElbowYaw", "LElbowRoll"
     ]
     
-    times = [[] for _ in joint_names]
-    angles = [[] for _ in joint_names]
+    # Pre-compute full payload (all frames + per-frame speech)
+    print("Building full motion + speech payload...\n")
+    all_times, all_angles, frame_texts = build_full_payload(bvh, tsv, joint_names)
     
-    current_time = 2.0  
-    frame_step = 3      
-    time_delta = bvh.frame_time * frame_step
-    
-    last_angles = [None] * len(joint_names)
-    max_velocity = 5.0
-    
-    for i in range(0, len(bvh.frames), frame_step):
-        frame_data = bvh.frames[i]
-        mapped = map_bvh_to_nao(frame_data, bvh.joint_channels)
-        
-        for j, name in enumerate(joint_names):
-            target_angle = mapped[name]
-            
-            # Software speed limit (smooths out BVH spikes)
-            if last_angles[j] is not None:
-                max_change = max_velocity * time_delta
-                diff = target_angle - last_angles[j]
-                if abs(diff) > max_change:
-                    target_angle = last_angles[j] + math.copysign(max_change, diff)
-            
-            times[j].append(current_time)
-            angles[j].append(target_angle)
-            last_angles[j] = target_angle
-            
-        current_time += time_delta
-
-    # Find out exactly how long the animation takes
-    total_duration = max([t[-1] for t in times if t])
-
-    print(f"Sending trajectory payload. Animation will run for {total_duration:.1f} seconds.")
-    
-    # Execute the trajectory on the server as a separate thread
-    # The server will make a blocking call to the simulator, but we execute it in the background
-    trajectory_thread = threading.Thread(
-        target=nao.play_trajectory, 
-        args=(joint_names, angles, times),
-        daemon=False
-    )
-    trajectory_thread.start()
-    
-    # Find and play the corresponding audio file in a separate thread
-    wav_filepath = get_wav_file(bvh_filepath)
-    play_audio_in_thread(wav_filepath)
-
-    # Because the trajectory is running in a background thread, we must keep Python 3 
-    # alive until it completes so it can listen for your Ctrl+C
+    # Send everything in ONE XML-RPC call — server handles streaming
     try:
-        print("Robot is moving! Press Ctrl+C at any time to abort...")
-        trajectory_thread.join()  # Wait for the trajectory to complete
+        print("[→] Sending full payload to NAO server (one RPC call)...")
+        print("[⏳] Server is now streaming motion + speech to the robot...\n")
+        nao.play_motion_with_speech(joint_names, all_angles, all_times, frame_texts)
         
-        # If it finishes naturally without you pressing Ctrl+C:
-        print("Animation complete. Putting robot to rest.")
+        print("\n[✓] Animation complete. Putting robot to rest.")
         nao.rest()
 
     except KeyboardInterrupt:
-        # If you press Ctrl+C, this block catches it and sends the stop command!
         print("\n[!] Ctrl+C detected! Aborting robot motion...")
         nao.stop()
+    except Exception as e:
+        print(f"\n[!] Error during playback: {e}")
+        try:
+            nao.stop()
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
