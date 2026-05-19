@@ -1,8 +1,12 @@
 """
 GestureTransformer — Encoder-only Transformer for motion prediction.
 
-Input:  (Batch, Frames, 1536)  — concatenated Wav2Vec2 + DistilBERT features
-Output: (Batch, Frames, 12, 3) — root-relative XYZ positions for 12 upper-body joints
+Default GENEA mode:
+  Input:  (Batch, Frames, 1536)  — concatenated Wav2Vec2 + DistilBERT features
+  Output: (Batch, Frames, 12, 3) — root-relative XYZ positions
+
+BEAT/NAO preprocessing can override input_dim/output shape from LMDB metadata,
+for example prosody features -> (Batch, Frames, 10) NAO joint angles.
 """
 
 import torch
@@ -39,9 +43,12 @@ class GestureTransformer(nn.Module):
     """
 
     def __init__(self, input_dim=1536, hidden_dim=256, num_heads=8,
-                 num_layers=4, num_joints=12):
+                 num_layers=4, num_joints=12, target_shape=None):
         super().__init__()
-        self.num_joints = num_joints
+        if target_shape is None:
+            target_shape = (num_joints, 3)
+        self.target_shape = tuple(target_shape)
+        output_dim = math.prod(self.target_shape)
 
         self.input_norm = nn.LayerNorm(input_dim)
         self.input_projection = nn.Sequential(
@@ -61,7 +68,7 @@ class GestureTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers
         )
-        self.output_projection = nn.Linear(hidden_dim, num_joints * 3)
+        self.output_projection = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, x):
         x = self.input_norm(x)
@@ -69,4 +76,4 @@ class GestureTransformer(nn.Module):
         x = self.pos_encoder(x)
         x = self.transformer_encoder(x)
         x = self.output_projection(x)
-        return x.view(x.size(0), x.size(1), self.num_joints, 3)
+        return x.view(x.size(0), x.size(1), *self.target_shape)
