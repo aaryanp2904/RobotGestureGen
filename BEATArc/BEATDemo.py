@@ -34,9 +34,16 @@ from main_ik_client import (
     bvh_to_nao_space, solve_nao_arm_ik,
     play_audio_in_thread,
 )
-from parse_annotations import parse_textgrid
-from extract_positions import axis_angle_to_matrix
-from config import MOTION_DIR, AUDIO_DIR, TEXTGRID_DIR, SPLIT_CSV, MOCAP_FPS
+try:
+    from .config import MOTION_DIR, AUDIO_DIR, TEXTGRID_DIR, SPLIT_CSV, MOCAP_FPS
+    from .nao_constants import NAO_JOINTS, NAO_MAX_VEL
+    from .parse_annotations import parse_textgrid
+    from .smplx_utils import axis_angle_to_matrix
+except ImportError:
+    from config import MOTION_DIR, AUDIO_DIR, TEXTGRID_DIR, SPLIT_CSV, MOCAP_FPS
+    from nao_constants import NAO_JOINTS, NAO_MAX_VEL
+    from parse_annotations import parse_textgrid
+    from smplx_utils import axis_angle_to_matrix
 
 # ---------------------------------------------------------------------------
 # SMPL-X pose slices (body joint index → poses array column)
@@ -162,21 +169,6 @@ def get_text_at_time(word_list, t):
 # ---------------------------------------------------------------------------
 # Payload builder (mirrors main_ik_client.build_full_payload)
 # ---------------------------------------------------------------------------
-
-NAO_JOINTS = [
-    "HeadYaw", "HeadPitch",
-    "RShoulderPitch", "RShoulderRoll", "RElbowYaw", "RElbowRoll",
-    "LShoulderPitch", "LShoulderRoll", "LElbowYaw", "LElbowRoll",
-]
-
-NAO_MAX_VEL = {
-    "HeadYaw": 8.27 * 0.8, "HeadPitch": 7.19 * 0.8,
-    "RShoulderPitch": 8.27 * 0.8, "RShoulderRoll": 7.19 * 0.8,
-    "RElbowYaw": 8.27 * 0.8, "RElbowRoll": 8.27 * 0.8,
-    "LShoulderPitch": 8.27 * 0.8, "LShoulderRoll": 7.19 * 0.8,
-    "LElbowYaw": 8.27 * 0.8, "LElbowRoll": 8.27 * 0.8,
-}
-
 
 def build_payload(poses, word_list, fps=MOCAP_FPS, text_time_offset=0.0):
     """

@@ -8,7 +8,7 @@ Input:
 
 Output:
   - .npy array shaped (frames, 10), containing denormalized NAO joint angles
-    in BEATDemo.NAO_JOINTS order.
+    in nao_constants.NAO_JOINTS order.
 """
 
 import argparse
@@ -23,16 +23,28 @@ import torchaudio
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "machine_learning" / "transformers"))
 
 from pos_end import GestureTransformer
-from BEATDemo import NAO_JOINTS
-from config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
-from parse_annotations import parse_textgrid
-from preprocess_nao import (
-    PROSODY_FEATURE_NAMES,
-    TEXT_EMBED_DIM,
-    extract_prosody,
-    extract_text_features,
-    init_text_models,
-)
+try:
+    from .config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
+    from .nao_constants import NAO_JOINTS
+    from .parse_annotations import parse_textgrid
+    from .preprocess_nao import (
+        PROSODY_FEATURE_NAMES,
+        TEXT_EMBED_DIM,
+        extract_prosody,
+        extract_text_features,
+        init_text_models,
+    )
+except ImportError:
+    from config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
+    from nao_constants import NAO_JOINTS
+    from parse_annotations import parse_textgrid
+    from preprocess_nao import (
+        PROSODY_FEATURE_NAMES,
+        TEXT_EMBED_DIM,
+        extract_prosody,
+        extract_text_features,
+        init_text_models,
+    )
 
 
 def resolve_wav(args) -> Path:

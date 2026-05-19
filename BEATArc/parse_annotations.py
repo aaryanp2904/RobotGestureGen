@@ -21,7 +21,10 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-from config import TEXTGRID_DIR, SEM_DIR, OUTPUT_DIR
+try:
+    from .config import TEXTGRID_DIR, SEM_DIR, OUTPUT_DIR
+except ImportError:
+    from config import TEXTGRID_DIR, SEM_DIR, OUTPUT_DIR
 
 
 # ---------------------------------------------------------------------------

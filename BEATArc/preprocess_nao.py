@@ -24,17 +24,32 @@ import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 
-from BEATDemo import NAO_JOINTS, map_smplx_to_nao
-from config import (
-    AUDIO_DIR,
-    AUDIO_SR,
-    MOCAP_FPS,
-    MOTION_DIR,
-    NAO_OUTPUT_DIR,
-    SPLIT_CSV,
-    TEXTGRID_DIR,
-)
-from parse_annotations import parse_textgrid
+try:
+    from .BEATDemo import map_smplx_to_nao
+    from .config import (
+        AUDIO_DIR,
+        AUDIO_SR,
+        MOCAP_FPS,
+        MOTION_DIR,
+        NAO_OUTPUT_DIR,
+        SPLIT_CSV,
+        TEXTGRID_DIR,
+    )
+    from .nao_constants import NAO_JOINTS, NAO_MAX_VEL
+    from .parse_annotations import parse_textgrid
+except ImportError:
+    from BEATDemo import map_smplx_to_nao
+    from config import (
+        AUDIO_DIR,
+        AUDIO_SR,
+        MOCAP_FPS,
+        MOTION_DIR,
+        NAO_OUTPUT_DIR,
+        SPLIT_CSV,
+        TEXTGRID_DIR,
+    )
+    from nao_constants import NAO_JOINTS, NAO_MAX_VEL
+    from parse_annotations import parse_textgrid
 
 
 PROSODY_FEATURE_NAMES = [
@@ -50,20 +65,6 @@ PROSODY_FEATURE_NAMES = [
 ]
 
 TEXT_EMBED_DIM = 768
-
-NAO_MAX_VEL = {
-    "HeadYaw": 8.27 * 0.8,
-    "HeadPitch": 7.19 * 0.8,
-    "RShoulderPitch": 8.27 * 0.8,
-    "RShoulderRoll": 7.19 * 0.8,
-    "RElbowYaw": 8.27 * 0.8,
-    "RElbowRoll": 8.27 * 0.8,
-    "LShoulderPitch": 8.27 * 0.8,
-    "LShoulderRoll": 7.19 * 0.8,
-    "LElbowYaw": 8.27 * 0.8,
-    "LElbowRoll": 8.27 * 0.8,
-}
-
 
 class BatchedStats:
     """Streaming mean/std over arrays with shape (frames, feature_dim)."""
