@@ -64,8 +64,14 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         f"--clip-id {remote_quote(args.clip_id)} "
         f"--audio-dir {remote_quote(audio_dir)} "
         f"--textgrid-dir {remote_quote(textgrid_dir)} "
+        f"--window-size {remote_quote(str(args.window_size))} "
+        f"--stride {remote_quote(str(args.stride))} "
         f"--output {remote_quote(remote_output)}"
     )
+    if args.model_type != "auto":
+        command += f" --model-type {remote_quote(args.model_type)}"
+    if args.seed is not None:
+        command += f" --seed {remote_quote(str(args.seed))}"
     if args.text_cpu:
         command += " --text-cpu"
     return command
@@ -153,6 +159,15 @@ def main():
                         help="Remote model checkpoint path")
     parser.add_argument("--stats", default=DEFAULT_STATS,
                         help="Remote normalization_stats.json path")
+    parser.add_argument("--model-type", choices=["auto", "transformer", "diffusion"],
+                        default="auto",
+                        help="Remote inference model family. Use diffusion for diffusion checkpoints")
+    parser.add_argument("--window-size", type=float, default=2.0,
+                        help="Inference window size in seconds")
+    parser.add_argument("--stride", type=float, default=0.5,
+                        help="Inference stride in seconds")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Optional random seed for remote diffusion sampling")
     parser.add_argument("--local-dir", default="nao_predictions",
                         help="Local destination directory")
     parser.add_argument("--remote-python", default="python",
