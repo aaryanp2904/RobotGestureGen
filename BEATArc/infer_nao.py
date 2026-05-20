@@ -33,7 +33,7 @@ def model_init_kwargs(model_config: dict) -> dict:
 
 try:
     from .config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
-    from .nao_constants import NAO_JOINTS
+    from .nao_constants import NAO_JOINTS, NAO_LIMITS
     from .parse_annotations import parse_textgrid
     from .preprocess_nao import (
         PROSODY_FEATURE_NAMES,
@@ -44,7 +44,7 @@ try:
     )
 except ImportError:
     from config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
-    from nao_constants import NAO_JOINTS
+    from nao_constants import NAO_JOINTS, NAO_LIMITS
     from parse_annotations import parse_textgrid
     from preprocess_nao import (
         PROSODY_FEATURE_NAMES,
@@ -83,6 +83,35 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device):
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         return checkpoint["model_state_dict"], checkpoint.get("model_config", {})
     return checkpoint, {}
+
+
+def validate_inference_contract(model_config: dict, stats: dict):
+    if not model_config:
+        raise ValueError(
+            "Checkpoint has no model_config. Use gesture_transformer_best.pth, "
+            "gesture_transformer_latest.pth, or a newly saved full_trained checkpoint."
+        )
+
+    required_stats = ["prosody_mean", "prosody_std", "nao_mean", "nao_std"]
+    target_mode = model_config.get("target_mode", stats.get("target_mode", "angle"))
+    if target_mode == "delta":
+        required_stats.extend(["nao_vel_mean", "nao_vel_std"])
+
+    missing = [key for key in required_stats if key not in stats]
+    if missing:
+        raise ValueError(f"Stats file is missing required keys: {missing}")
+
+    stats_mode = stats.get("target_mode")
+    if stats_mode is not None and stats_mode != target_mode:
+        raise ValueError(
+            f"Checkpoint target_mode ({target_mode}) does not match stats target_mode ({stats_mode})"
+        )
+
+    if tuple(model_config.get("target_shape", ())) != (len(NAO_JOINTS),):
+        raise ValueError(
+            f"Expected NAO target_shape ({len(NAO_JOINTS)},), "
+            f"got {model_config.get('target_shape')}"
+        )
 
 
 def build_features(wav_path: Path, words: list[dict], model_config: dict,
@@ -162,6 +191,14 @@ def denormalize_nao(pred_norm: np.ndarray, stats: dict) -> np.ndarray:
     return pred_norm * std + mean
 
 
+def clamp_nao_angles(angles: np.ndarray) -> np.ndarray:
+    out = angles.copy()
+    for joint_idx, name in enumerate(NAO_JOINTS):
+        low, high = NAO_LIMITS[name]
+        out[:, joint_idx] = np.clip(out[:, joint_idx], low, high)
+    return out
+
+
 def reconstruct_nao_angles(pred_norm: np.ndarray, stats: dict, model_config: dict) -> np.ndarray:
     target_mode = model_config.get("target_mode", stats.get("target_mode", "angle"))
     if target_mode == "angle":
@@ -172,6 +209,8 @@ def reconstruct_nao_angles(pred_norm: np.ndarray, stats: dict, model_config: dic
     vel_mean = np.array(stats["nao_vel_mean"], dtype=np.float32)
     vel_std = np.array(stats["nao_vel_std"], dtype=np.float32)
     deltas = pred_norm * vel_std + vel_mean
+    if len(deltas) > 0:
+        deltas[0] = 0.0
     initial_pose = np.array(stats["nao_mean"], dtype=np.float32)
     return initial_pose + np.cumsum(deltas, axis=0)
 
@@ -216,11 +255,7 @@ def main():
         stats = json.load(f)
 
     state_dict, model_config = load_checkpoint(Path(args.checkpoint), device)
-    if not model_config:
-        model_config = {
-            "input_dim": len(PROSODY_FEATURE_NAMES),
-            "target_shape": [len(NAO_JOINTS)],
-        }
+    validate_inference_contract(model_config, stats)
 
     print(f"[LOAD] WAV:        {wav_path}")
     print(f"[LOAD] TextGrid:   {textgrid_path if textgrid_path else 'NONE'}")
@@ -240,6 +275,7 @@ def main():
     stride_frames = int(round(args.stride * args.fps))
     pred_norm = run_inference(model, features, window_frames, stride_frames, device)
     pred_angles = reconstruct_nao_angles(pred_norm, stats, model_config).astype(np.float32)
+    pred_angles = clamp_nao_angles(pred_angles).astype(np.float32)
 
     np.save(output_path, pred_angles)
     print(f"[OUT] Saved:       {output_path}")

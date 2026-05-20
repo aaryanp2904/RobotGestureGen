@@ -210,7 +210,7 @@ def build_payload(poses, word_list, fps=MOCAP_FPS, text_time_offset=0.0):
             all_times[j].append(current_time)
             all_angles[j].append(mapped[name])
 
-        text = get_text_at_time(word_list, text_time_offset + current_time)
+        text = get_text_at_time(word_list, text_time_offset + i * frame_time)
         frame_texts.append(text)
         current_time += frame_time
 

@@ -29,6 +29,13 @@ def model_init_kwargs(model_config: dict) -> dict:
     return {key: value for key, value in model_config.items() if key in MODEL_INIT_KEYS}
 
 
+def unpack_batch(batch):
+    if len(batch) == 3:
+        return batch
+    bx, by = batch
+    return bx, by, None
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -92,7 +99,10 @@ class PreprocessedLMDBDataset(Dataset):
         if value is None:
             raise KeyError(f"Key {idx:08d} not found in LMDB")
         raw = pickle.loads(value)
-        return self._to_f32(raw["x"]), self._to_f32(raw["y"])
+        y_vel = raw.get("y_vel")
+        if y_vel is None:
+            y_vel = np.zeros_like(raw["y"], dtype=np.float32)
+        return self._to_f32(raw["x"]), self._to_f32(raw["y"]), self._to_f32(y_vel)
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +112,7 @@ class PreprocessedLMDBDataset(Dataset):
 def train_model(dataloader, epochs=50, sanity_check=False, device=None,
                 model_config=None, val_dataloader=None, checkpoint_dir=".",
                 velocity_loss_weight=0.0, acceleration_loss_weight=0.0,
-                log_every=100):
+                velocity_target_loss_weight=0.0, log_every=100):
     """Train or sanity-check the GestureTransformer."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,12 +122,24 @@ def train_model(dataloader, epochs=50, sanity_check=False, device=None,
 
     if model_config is None:
         model_config = {}
+    if velocity_target_loss_weight > 0 and any(
+        model_config.get(key) is None for key in ("nao_std", "nao_vel_mean", "nao_vel_std")
+    ):
+        raise ValueError(
+            "--velocity-target-loss-weight requires a freshly preprocessed LMDB "
+            "with nao_std, nao_vel_mean, and nao_vel_std metadata."
+        )
     model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
     model.config = dict(model_config)
     criterion = MotionLoss(
         velocity_weight=velocity_loss_weight,
         acceleration_weight=acceleration_loss_weight,
-    )
+        velocity_target_weight=velocity_target_loss_weight,
+        target_mode=model_config.get("target_mode", "angle"),
+        angle_std=model_config.get("nao_std"),
+        vel_mean=model_config.get("nao_vel_mean"),
+        vel_std=model_config.get("nao_vel_std"),
+    ).to(device)
     lr = 1e-3 if sanity_check else 1e-4
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -138,27 +160,59 @@ def train_model(dataloader, epochs=50, sanity_check=False, device=None,
 class MotionLoss(nn.Module):
     """Pose MSE plus optional velocity/acceleration MSE over the time axis."""
 
-    def __init__(self, velocity_weight=0.0, acceleration_weight=0.0):
+    def __init__(self, velocity_weight=0.0, acceleration_weight=0.0,
+                 velocity_target_weight=0.0, target_mode="angle",
+                 angle_std=None, vel_mean=None, vel_std=None):
         super().__init__()
         self.velocity_weight = float(velocity_weight)
         self.acceleration_weight = float(acceleration_weight)
+        self.velocity_target_weight = float(velocity_target_weight)
+        self.target_mode = target_mode
         self.mse = nn.MSELoss()
+        self.register_buffer(
+            "angle_std",
+            torch.as_tensor(angle_std if angle_std is not None else [1.0], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "vel_mean",
+            torch.as_tensor(vel_mean if vel_mean is not None else [0.0], dtype=torch.float32),
+        )
+        self.register_buffer(
+            "vel_std",
+            torch.as_tensor(vel_std if vel_std is not None else [1.0], dtype=torch.float32),
+        )
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, target_velocity=None):
         pose_loss = self.mse(pred, target)
         total = pose_loss
 
-        if self.velocity_weight > 0 and pred.shape[1] > 1:
+        if self.velocity_weight > 0 and self.target_mode == "angle" and pred.shape[1] > 1:
             pred_vel = pred[:, 1:] - pred[:, :-1]
             target_vel = target[:, 1:] - target[:, :-1]
             total = total + self.velocity_weight * self.mse(pred_vel, target_vel)
 
-        if self.acceleration_weight > 0 and pred.shape[1] > 2:
+        if self.acceleration_weight > 0 and self.target_mode == "angle" and pred.shape[1] > 2:
             pred_vel = pred[:, 1:] - pred[:, :-1]
             target_vel = target[:, 1:] - target[:, :-1]
             pred_acc = pred_vel[:, 1:] - pred_vel[:, :-1]
             target_acc = target_vel[:, 1:] - target_vel[:, :-1]
             total = total + self.acceleration_weight * self.mse(pred_acc, target_acc)
+
+        if (
+            self.velocity_target_weight > 0
+            and self.target_mode == "angle"
+            and target_velocity is not None
+            and pred.shape[1] > 1
+        ):
+            shape = (1, 1) + tuple(self.angle_std.shape)
+            angle_std = self.angle_std.view(shape)
+            vel_mean = self.vel_mean.view(shape)
+            vel_std = self.vel_std.view(shape)
+            pred_delta = (pred[:, 1:] - pred[:, :-1]) * angle_std
+            pred_velocity_norm = (pred_delta - vel_mean) / vel_std
+            total = total + self.velocity_target_weight * self.mse(
+                pred_velocity_norm, target_velocity[:, 1:]
+            )
 
         return total
 
@@ -166,15 +220,17 @@ class MotionLoss(nn.Module):
 def _sanity_check(model, criterion, optimizer, scaler, dataloader, device):
     """Overfit a single batch 500 times to verify the model can learn."""
     print("\n[SANITY] Overfitting single batch × 500", flush=True)
-    batch_x, batch_y = next(iter(dataloader))
+    batch_x, batch_y, batch_vel = unpack_batch(next(iter(dataloader)))
     batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+    if batch_vel is not None:
+        batch_vel = batch_vel.to(device)
     print(f"[SANITY] X: {batch_x.shape}, Y: {batch_y.shape}", flush=True)
 
     for i in range(500):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            loss = criterion(model(batch_x), batch_y)
+            loss = criterion(model(batch_x), batch_y, batch_vel)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -195,11 +251,14 @@ def _evaluate(model, criterion, dataloader, device):
     total_loss = 0.0
     total_batches = 0
     with torch.no_grad():
-        for bx, by in dataloader:
+        for batch in dataloader:
+            bx, by, bvel = unpack_batch(batch)
             bx = bx.to(device, non_blocking=True)
             by = by.to(device, non_blocking=True)
+            if bvel is not None:
+                bvel = bvel.to(device, non_blocking=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                loss = criterion(model(bx), by)
+                loss = criterion(model(bx), by, bvel)
             total_loss += loss.item()
             total_batches += 1
 
@@ -226,7 +285,8 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
     if isinstance(criterion, MotionLoss):
         print(
             f"[LOSS] pose_mse + {criterion.velocity_weight:g}*velocity_mse "
-            f"+ {criterion.acceleration_weight:g}*acceleration_mse\n",
+            f"+ {criterion.acceleration_weight:g}*acceleration_mse "
+            f"+ {criterion.velocity_target_weight:g}*target_velocity_mse\n",
             flush=True,
         )
     if val_dataloader is not None:
@@ -242,7 +302,8 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
         t0 = time.time()
         print(f"[TRAIN] Epoch {epoch+1}: loading first batch...", flush=True)
 
-        for batch_idx, (bx, by) in enumerate(dataloader):
+        for batch_idx, batch in enumerate(dataloader):
+            bx, by, bvel = unpack_batch(batch)
             if batch_idx == 0:
                 print(
                     f"[TRAIN] Epoch {epoch+1}: first batch loaded "
@@ -251,10 +312,12 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
                 )
             bx = bx.to(device, non_blocking=True)
             by = by.to(device, non_blocking=True)
+            if bvel is not None:
+                bvel = bvel.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                loss = criterion(model(bx), by)
+                loss = criterion(model(bx), by, bvel)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -302,7 +365,10 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
             metric_value = val_loss if val_loss is not None else avg
             print(f"[CHECKPOINT] ✓ New best {metric_name} loss: {metric_value:.6f}")
 
-    torch.save(model.state_dict(), checkpoint_dir / "gesture_transformer_full_trained.pth")
+    _save_checkpoint(
+        checkpoint_dir / "gesture_transformer_full_trained.pth",
+        model, getattr(model, "config", {}), epochs, avg, val_loss,
+    )
     print(f"[TRAIN] ✓ Saved checkpoints to {checkpoint_dir}")
 
 
@@ -329,6 +395,8 @@ if __name__ == "__main__":
                         help="Weight for frame-to-frame velocity MSE loss")
     parser.add_argument("--acceleration-loss-weight", type=float, default=0.0,
                         help="Weight for second-difference acceleration MSE loss")
+    parser.add_argument("--velocity-target-loss-weight", type=float, default=0.0,
+                        help="Weight for LMDB y_vel supervision in angle mode")
     args = parser.parse_args()
 
     dataset = PreprocessedLMDBDataset(args.data_dir)
@@ -337,6 +405,9 @@ if __name__ == "__main__":
         "target_shape": tuple(dataset.metadata.get("target_shape", [12, 3])),
         "target_mode": dataset.metadata.get("target_mode", "angle"),
         "target_type": dataset.metadata.get("target_type", "unknown"),
+        "nao_std": dataset.metadata.get("nao_std"),
+        "nao_vel_mean": dataset.metadata.get("nao_vel_mean"),
+        "nao_vel_std": dataset.metadata.get("nao_vel_std"),
     }
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -365,6 +436,9 @@ if __name__ == "__main__":
                 "target_shape": tuple(val_dataset.metadata.get("target_shape", [12, 3])),
                 "target_mode": val_dataset.metadata.get("target_mode", "angle"),
                 "target_type": val_dataset.metadata.get("target_type", "unknown"),
+                "nao_std": val_dataset.metadata.get("nao_std"),
+                "nao_vel_mean": val_dataset.metadata.get("nao_vel_mean"),
+                "nao_vel_std": val_dataset.metadata.get("nao_vel_std"),
             }
             if val_model_config != model_config:
                 raise ValueError(
@@ -385,6 +459,7 @@ if __name__ == "__main__":
             model_config=model_config,
             velocity_loss_weight=args.velocity_loss_weight,
             acceleration_loss_weight=args.acceleration_loss_weight,
+            velocity_target_loss_weight=args.velocity_target_loss_weight,
             log_every=args.log_every,
         )
     else:
@@ -396,5 +471,6 @@ if __name__ == "__main__":
             checkpoint_dir=args.output_dir,
             velocity_loss_weight=args.velocity_loss_weight,
             acceleration_loss_weight=args.acceleration_loss_weight,
+            velocity_target_loss_weight=args.velocity_target_loss_weight,
             log_every=args.log_every,
         )

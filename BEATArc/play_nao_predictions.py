@@ -11,6 +11,7 @@ Expected prediction shape:
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -99,10 +100,8 @@ def prepare_angles(preds: np.ndarray, fps: float, velocity_limit=True):
 def build_frame_texts(num_frames: int, fps: float, word_list, time_offset=0.0):
     frame_time = 1.0 / fps
     frame_texts = []
-    current_time = frame_time
-    for _ in range(num_frames):
-        frame_texts.append(get_text_at_time(word_list, time_offset + current_time))
-        current_time += frame_time
+    for frame_idx in range(num_frames):
+        frame_texts.append(get_text_at_time(word_list, time_offset + frame_idx * frame_time))
     return frame_texts
 
 
@@ -151,6 +150,18 @@ def connect_nao(server_url: str):
     return xmlrpc.client.ServerProxy(server_url, allow_none=True)
 
 
+def load_sidecar_metadata(pred_path: Path) -> dict:
+    meta_path = pred_path.with_suffix(".json")
+    if not meta_path.is_file():
+        return {}
+    try:
+        with open(meta_path, "r") as f:
+            return json.load(f)
+    except Exception as exc:
+        print(f"[WARN] Could not read metadata {meta_path}: {exc}")
+        return {}
+
+
 def main():
     parser = argparse.ArgumentParser(description="Play generated NAO joint-angle predictions")
     parser.add_argument("predictions", type=str,
@@ -159,7 +170,8 @@ def main():
                         help="Optional WAV to play alongside motion")
     parser.add_argument("--textgrid", type=str, default=None,
                         help="Optional TextGrid for NAO speech text events")
-    parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Playback FPS; defaults to prediction metadata or 30")
     parser.add_argument("--server", type=str, default="http://localhost:8000")
     parser.add_argument("--no-audio", action="store_true")
     parser.add_argument("--no-velocity-limit", action="store_true",
@@ -173,20 +185,22 @@ def main():
     pred_path = Path(args.predictions)
     wav_path = Path(args.wav) if args.wav else None
     textgrid_path = Path(args.textgrid) if args.textgrid else None
+    metadata = load_sidecar_metadata(pred_path)
+    fps = args.fps if args.fps is not None else float(metadata.get("fps", 30.0))
 
     preds = load_predictions(pred_path)
-    duration = preds.shape[0] / args.fps
+    duration = preds.shape[0] / fps
     print(f"[LOAD] Predictions: {pred_path}")
     print(f"[LOAD] Shape:       {preds.shape}")
-    print(f"[LOAD] Duration:    {duration:.2f}s @ {args.fps:.1f} fps")
+    print(f"[LOAD] Duration:    {duration:.2f}s @ {fps:.1f} fps")
     print(f"[LOAD] Joint order: {NAO_JOINTS}")
 
     all_times, all_angles = prepare_angles(
-        preds, args.fps, velocity_limit=not args.no_velocity_limit
+        preds, fps, velocity_limit=not args.no_velocity_limit
     )
     word_list = build_word_lookup(textgrid_path)
     frame_texts = build_frame_texts(
-        preds.shape[0], args.fps, word_list, time_offset=args.time_offset
+        preds.shape[0], fps, word_list, time_offset=args.time_offset
     )
     speech_frames = sum(1 for text in frame_texts if text)
     print(f"[TEXT] Words:       {len(word_list)}")

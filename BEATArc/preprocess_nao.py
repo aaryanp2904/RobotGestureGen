@@ -15,6 +15,7 @@ import csv
 import json
 import math
 import pickle
+import shutil
 import sys
 from pathlib import Path
 
@@ -269,8 +270,31 @@ def frame_velocity(values: np.ndarray) -> np.ndarray:
     vel = np.zeros_like(values, dtype=np.float32)
     if len(values) > 1:
         vel[1:] = values[1:] - values[:-1]
-        vel[0] = vel[1]
     return vel
+
+
+def window_starts(total_frames: int, window_frames: int, stride_frames: int) -> list[int]:
+    if total_frames <= window_frames:
+        return [0]
+    starts = list(range(0, total_frames - window_frames + 1, stride_frames))
+    last = total_frames - window_frames
+    if starts[-1] != last:
+        starts.append(last)
+    return starts
+
+
+def fixed_length_window(values: np.ndarray, start: int, window_frames: int,
+                        pad_mode: str = "repeat") -> np.ndarray:
+    window = values[start:start + window_frames]
+    if len(window) == window_frames:
+        return window
+    if len(window) == 0 or pad_mode == "zero":
+        pad = np.zeros((window_frames, *values.shape[1:]), dtype=values.dtype)
+        if len(window) == 0:
+            return pad
+        return np.concatenate([window, pad[:window_frames - len(window)]], axis=0)
+    pad = np.repeat(window[-1:], window_frames - len(window), axis=0)
+    return np.concatenate([window, pad], axis=0)
 
 
 def select_training_target(data, stats: dict, target_mode: str) -> np.ndarray:
@@ -417,6 +441,11 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
 
     for split, rows in sorted(rows_by_split.items()):
         lmdb_path = output_dir / f"{split}.lmdb"
+        if lmdb_path.exists():
+            if lmdb_path.is_dir():
+                shutil.rmtree(lmdb_path)
+            else:
+                lmdb_path.unlink()
         env = lmdb.open(str(lmdb_path), map_size=map_size_gb * 1024 ** 3)
         global_idx = 0
         file_window_map = {}
@@ -433,12 +462,16 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
 
             file_start = global_idx
             window_count = 0
-            for start in range(0, len(y) - window_frames + 1, stride_frames):
-                end = start + window_frames
+            for start in window_starts(len(y), window_frames, stride_frames):
+                y_pad_mode = "zero" if target_mode == "delta" else "repeat"
                 value = pickle.dumps({
-                    "x": x[start:end].astype(np.float16),
-                    "y": y[start:end].astype(np.float16),
-                    "y_vel": velocity[start:end].astype(np.float16),
+                    "x": fixed_length_window(x, start, window_frames).astype(np.float16),
+                    "y": fixed_length_window(
+                        y, start, window_frames, pad_mode=y_pad_mode
+                    ).astype(np.float16),
+                    "y_vel": fixed_length_window(
+                        velocity, start, window_frames, pad_mode="zero"
+                    ).astype(np.float16),
                     "clip_id": clip_id,
                     "split": split,
                     "start_frame": start,
@@ -468,6 +501,10 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
             ),
             "feature_names": PROSODY_FEATURE_NAMES,
             "target_names": NAO_JOINTS,
+            "nao_mean": stats["nao_mean"],
+            "nao_std": stats["nao_std"],
+            "nao_vel_mean": stats["nao_vel_mean"],
+            "nao_vel_std": stats["nao_vel_std"],
         }
 
         txn.put(b"__len__", pickle.dumps(global_idx))
@@ -603,6 +640,11 @@ def preprocess(args):
     prosody_mean, prosody_std = prosody_stats.finalise()
     nao_mean, nao_std = nao_stats.finalise()
     vel_mean, vel_std = vel_stats.finalise()
+    if prosody_stats.n == 0:
+        raise RuntimeError(
+            "No training frames were found. Run preprocessing with the train split "
+            "included so normalization statistics are valid."
+        )
     stats = {
         "prosody_feature_names": PROSODY_FEATURE_NAMES,
         "nao_joint_names": NAO_JOINTS,
