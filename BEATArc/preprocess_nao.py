@@ -273,6 +273,19 @@ def frame_velocity(values: np.ndarray) -> np.ndarray:
     return vel
 
 
+def select_training_target(data, stats: dict, target_mode: str) -> np.ndarray:
+    """Return the normalized LMDB target for the selected training mode."""
+    if target_mode == "angle":
+        mean = np.array(stats["nao_mean"], dtype=np.float32)
+        std = np.array(stats["nao_std"], dtype=np.float32)
+        return (data["nao_angles"] - mean) / std
+    if target_mode == "delta":
+        mean = np.array(stats["nao_vel_mean"], dtype=np.float32)
+        std = np.array(stats["nao_vel_std"], dtype=np.float32)
+        return (data["nao_velocity"] - mean) / std
+    raise ValueError(f"Unsupported target_mode: {target_mode}")
+
+
 def load_words(clip_id: str) -> list[dict]:
     tg_path = TEXTGRID_DIR / f"{clip_id}.TextGrid"
     if not tg_path.is_file():
@@ -383,7 +396,7 @@ def save_stats(output_dir: Path, stats: dict):
 
 def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
                window_frames: int, stride_frames: int, map_size_gb: int,
-               text_dim: int = 0):
+               text_dim: int = 0, target_mode: str = "angle"):
     try:
         import lmdb
     except ImportError:
@@ -392,8 +405,6 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
 
     prosody_mean = np.array(stats["prosody_mean"], dtype=np.float32)
     prosody_std = np.array(stats["prosody_std"], dtype=np.float32)
-    nao_mean = np.array(stats["nao_mean"], dtype=np.float32)
-    nao_std = np.array(stats["nao_std"], dtype=np.float32)
     vel_mean = np.array(stats["nao_vel_mean"], dtype=np.float32)
     vel_std = np.array(stats["nao_vel_std"], dtype=np.float32)
     clips_dir = output_dir / "clips"
@@ -417,16 +428,16 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
             prosody = (data["prosody"] - prosody_mean) / prosody_std
             text_features = data["text_features"].astype(np.float32)
             x = np.concatenate([prosody, text_features], axis=1)
-            angles = (data["nao_angles"] - nao_mean) / nao_std
+            y = select_training_target(data, stats, target_mode)
             velocity = (data["nao_velocity"] - vel_mean) / vel_std
 
             file_start = global_idx
             window_count = 0
-            for start in range(0, len(angles) - window_frames + 1, stride_frames):
+            for start in range(0, len(y) - window_frames + 1, stride_frames):
                 end = start + window_frames
                 value = pickle.dumps({
                     "x": x[start:end].astype(np.float16),
-                    "y": angles[start:end].astype(np.float16),
+                    "y": y[start:end].astype(np.float16),
                     "y_vel": velocity[start:end].astype(np.float16),
                     "clip_id": clip_id,
                     "split": split,
@@ -451,7 +462,10 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
             "prosody_dim": len(PROSODY_FEATURE_NAMES),
             "text_dim": text_dim,
             "target_shape": [len(NAO_JOINTS)],
-            "target_type": "nao_joint_angles",
+            "target_mode": target_mode,
+            "target_type": (
+                "nao_joint_deltas" if target_mode == "delta" else "nao_joint_angles"
+            ),
             "feature_names": PROSODY_FEATURE_NAMES,
             "target_names": NAO_JOINTS,
         }
@@ -598,6 +612,7 @@ def preprocess(args):
         "nao_std": nao_std.tolist(),
         "nao_vel_mean": vel_mean.tolist(),
         "nao_vel_std": vel_std.tolist(),
+        "target_mode": args.target_mode,
         "num_train_frames": prosody_stats.n,
     }
     save_stats(output_dir, stats)
@@ -609,7 +624,8 @@ def preprocess(args):
         "dropped": {k: len(v) for k, v in dropped.items()},
         "motion_dir": str(Path(args.motion_dir)),
         "audio_dir": str(Path(args.audio_dir)),
-        "target": "nao_joint_angles",
+        "target_mode": args.target_mode,
+        "target": "nao_joint_deltas" if args.target_mode == "delta" else "nao_joint_angles",
         "prosody_features": PROSODY_FEATURE_NAMES,
         "include_text": args.include_text,
         "text_feature_dim": text_dim,
@@ -624,7 +640,7 @@ def preprocess(args):
         stride_frames = int(round(args.stride * MOCAP_FPS))
         windows = write_lmdb(
             output_dir, processed, stats, window_frames, stride_frames,
-            args.map_size_gb, text_dim=text_dim
+            args.map_size_gb, text_dim=text_dim, target_mode=args.target_mode
         )
         summary["total_windows"] = windows
         with open(output_dir / "preprocess_summary.json", "w") as f:
@@ -661,6 +677,8 @@ def main():
                         help="Run DistilBERT text embedding on CPU even if CUDA is available")
     parser.add_argument("--velocity-limit", action="store_true",
                         help="Apply NAO speed limiting to stored training targets")
+    parser.add_argument("--target-mode", choices=["angle", "delta"], default="angle",
+                        help="LMDB target: absolute NAO angles or frame-to-frame deltas")
     parser.add_argument("--disable-velocity-limit", action="store_true",
                         help=argparse.SUPPRESS)
     args = parser.parse_args()

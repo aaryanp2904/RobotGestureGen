@@ -23,6 +23,14 @@ import torchaudio
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "machine_learning" / "transformers"))
 
 from pos_end import GestureTransformer
+
+MODEL_INIT_KEYS = {"input_dim", "hidden_dim", "num_heads", "num_layers", "num_joints", "target_shape"}
+
+
+def model_init_kwargs(model_config: dict) -> dict:
+    return {key: value for key, value in model_config.items() if key in MODEL_INIT_KEYS}
+
+
 try:
     from .config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
     from .nao_constants import NAO_JOINTS
@@ -154,6 +162,20 @@ def denormalize_nao(pred_norm: np.ndarray, stats: dict) -> np.ndarray:
     return pred_norm * std + mean
 
 
+def reconstruct_nao_angles(pred_norm: np.ndarray, stats: dict, model_config: dict) -> np.ndarray:
+    target_mode = model_config.get("target_mode", stats.get("target_mode", "angle"))
+    if target_mode == "angle":
+        return denormalize_nao(pred_norm, stats)
+    if target_mode != "delta":
+        raise ValueError(f"Unsupported checkpoint target_mode: {target_mode}")
+
+    vel_mean = np.array(stats["nao_vel_mean"], dtype=np.float32)
+    vel_std = np.array(stats["nao_vel_std"], dtype=np.float32)
+    deltas = pred_norm * vel_std + vel_mean
+    initial_pose = np.array(stats["nao_mean"], dtype=np.float32)
+    return initial_pose + np.cumsum(deltas, axis=0)
+
+
 def save_metadata(output_path: Path, metadata: dict):
     meta_path = output_path.with_suffix(".json")
     with open(meta_path, "w") as f:
@@ -211,13 +233,13 @@ def main():
         wav_path, words, model_config, stats, args.fps, device, args.text_cpu
     )
 
-    model = GestureTransformer(**model_config).to(device)
+    model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
     model.load_state_dict(state_dict)
 
     window_frames = int(round(args.window_size * args.fps))
     stride_frames = int(round(args.stride * args.fps))
     pred_norm = run_inference(model, features, window_frames, stride_frames, device)
-    pred_angles = denormalize_nao(pred_norm, stats).astype(np.float32)
+    pred_angles = reconstruct_nao_angles(pred_norm, stats, model_config).astype(np.float32)
 
     np.save(output_path, pred_angles)
     print(f"[OUT] Saved:       {output_path}")
@@ -235,6 +257,7 @@ def main():
         "num_frames": int(pred_angles.shape[0]),
         "duration_sec": float(pred_angles.shape[0] / args.fps),
         "nao_joint_names": NAO_JOINTS,
+        "target_mode": model_config.get("target_mode", stats.get("target_mode", "angle")),
         "model_config": model_config,
     })
 

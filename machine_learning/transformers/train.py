@@ -22,6 +22,13 @@ import numpy as np
 from pos_end import GestureTransformer
 
 
+MODEL_INIT_KEYS = {"input_dim", "hidden_dim", "num_heads", "num_layers", "num_joints", "target_shape"}
+
+
+def model_init_kwargs(model_config: dict) -> dict:
+    return {key: value for key, value in model_config.items() if key in MODEL_INIT_KEYS}
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -105,7 +112,7 @@ def train_model(dataloader, epochs=50, sanity_check=False, device=None,
 
     if model_config is None:
         model_config = {}
-    model = GestureTransformer(**model_config).to(device)
+    model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
     model.config = dict(model_config)
     criterion = MotionLoss(
         velocity_weight=velocity_loss_weight,
@@ -328,6 +335,8 @@ if __name__ == "__main__":
     model_config = {
         "input_dim": int(dataset.metadata.get("input_dim", 1536)),
         "target_shape": tuple(dataset.metadata.get("target_shape", [12, 3])),
+        "target_mode": dataset.metadata.get("target_mode", "angle"),
+        "target_type": dataset.metadata.get("target_type", "unknown"),
     }
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
@@ -354,6 +363,8 @@ if __name__ == "__main__":
             val_model_config = {
                 "input_dim": int(val_dataset.metadata.get("input_dim", 1536)),
                 "target_shape": tuple(val_dataset.metadata.get("target_shape", [12, 3])),
+                "target_mode": val_dataset.metadata.get("target_mode", "angle"),
+                "target_type": val_dataset.metadata.get("target_type", "unknown"),
             }
             if val_model_config != model_config:
                 raise ValueError(
