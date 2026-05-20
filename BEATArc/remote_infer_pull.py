@@ -20,7 +20,8 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_REMOTE = "ap1922@oak11.doc.ic.ac.uk"
+DEFAULT_REMOTE = "ap1922@oak21.doc.ic.ac.uk"
+DEFAULT_JUMP_HOST = "shell1.doc.ic.ac.uk"
 DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
 DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
 DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
@@ -39,6 +40,14 @@ def run_command(command: list[str], dry_run=False):
 
 def remote_quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def ssh_command(remote: str, remote_command: str, jump_host: str = "") -> list[str]:
+    command = ["ssh"]
+    if jump_host:
+        command.extend(["-J", jump_host])
+    command.extend([remote, remote_command])
+    return command
 
 
 def build_remote_infer_command(args, remote_output: str) -> str:
@@ -62,8 +71,35 @@ def build_remote_infer_command(args, remote_output: str) -> str:
     return command
 
 
-def scp_from_remote(remote: str, remote_path: str, local_dir: Path, dry_run=False):
-    run_command(["scp", f"{remote}:{remote_path}", str(local_dir)], dry_run=dry_run)
+def scp_from_remote(
+    remote: str,
+    remote_path: str,
+    local_dir: Path,
+    jump_host: str = "",
+    dry_run=False,
+):
+    command = ["scp"]
+    if jump_host:
+        command.extend(["-o", f"ProxyJump={jump_host}"])
+    command.extend([f"{remote}:{remote_path}", str(local_dir)])
+    run_command(command, dry_run=dry_run)
+
+
+def copy_from_remote(args, remote_path: str, local_dir: Path):
+    scp_from_remote(
+        args.remote,
+        remote_path,
+        local_dir,
+        jump_host=args.jump_host,
+        dry_run=args.dry_run,
+    )
+
+
+def run_remote_command(args, remote_command: str):
+    run_command(
+        ssh_command(args.remote, remote_command, jump_host=args.jump_host),
+        dry_run=args.dry_run,
+    )
 
 
 def build_playback_command(local_dir: Path, clip_id: str, server: str,
@@ -104,7 +140,9 @@ def main():
     )
     parser.add_argument("clip_id", help="BEAT2 clip ID, e.g. 10_kieks_0_103_103")
     parser.add_argument("--remote", default=DEFAULT_REMOTE,
-                        help="SSH target, e.g. ap1922@oak11.doc.ic.ac.uk")
+                        help="SSH target, e.g. ap1922@oak21.doc.ic.ac.uk")
+    parser.add_argument("--jump-host", default=DEFAULT_JUMP_HOST,
+                        help="SSH jump host. Set to '' to connect directly")
     parser.add_argument("--remote-repo", default=DEFAULT_REMOTE_REPO,
                         help="Repository path on the remote machine")
     parser.add_argument("--remote-beat-root", default=DEFAULT_REMOTE_BEAT,
@@ -139,26 +177,21 @@ def main():
 
     remote_output = f"{args.remote_pred_dir}/{args.clip_id}.npy"
     remote_command = build_remote_infer_command(args, remote_output)
-    run_command(["ssh", args.remote, remote_command], dry_run=args.dry_run)
+    run_remote_command(args, remote_command)
 
-    scp_from_remote(args.remote, remote_output, local_dir, dry_run=args.dry_run)
-    scp_from_remote(
-        args.remote, f"{args.remote_pred_dir}/{args.clip_id}.json",
-        local_dir, dry_run=args.dry_run,
-    )
+    copy_from_remote(args, remote_output, local_dir)
+    copy_from_remote(args, f"{args.remote_pred_dir}/{args.clip_id}.json", local_dir)
 
     if not args.no_assets:
-        scp_from_remote(
-            args.remote,
+        copy_from_remote(
+            args,
             f"{args.remote_beat_root}/wave16k/{args.clip_id}.wav",
             local_dir,
-            dry_run=args.dry_run,
         )
-        scp_from_remote(
-            args.remote,
+        copy_from_remote(
+            args,
             f"{args.remote_beat_root}/textgrid/{args.clip_id}.TextGrid",
             local_dir,
-            dry_run=args.dry_run,
         )
 
     print(f"\n[DONE] Files copied to: {local_dir.resolve()}")
