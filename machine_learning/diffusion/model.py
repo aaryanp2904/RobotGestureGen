@@ -215,6 +215,7 @@ class DiffusionSchedule(nn.Module):
         noisy_motion: torch.Tensor,
         conditioning: torch.Tensor,
         timesteps: torch.Tensor,
+        add_noise: bool = True,
     ) -> torch.Tensor:
         betas_t = self._extract(self.betas, timesteps, noisy_motion.shape)
         sqrt_one_minus = self._extract(
@@ -230,6 +231,8 @@ class DiffusionSchedule(nn.Module):
             timesteps.shape[0], *((1,) * (noisy_motion.dim() - 1))
         )
         variance = self._extract(self.posterior_variance, timesteps, noisy_motion.shape)
+        if not add_noise:
+            return model_mean
         return model_mean + nonzero_mask * torch.sqrt(variance) * noise
 
     @torch.no_grad()
@@ -238,6 +241,7 @@ class DiffusionSchedule(nn.Module):
         model: nn.Module,
         conditioning: torch.Tensor,
         target_shape: tuple[int, ...],
+        add_noise: bool = True,
     ) -> torch.Tensor:
         model.eval()
         shape = (conditioning.shape[0], conditioning.shape[1], *target_shape)
@@ -249,5 +253,5 @@ class DiffusionSchedule(nn.Module):
                 device=conditioning.device,
                 dtype=torch.long,
             )
-            motion = self.p_sample(model, motion, conditioning, timesteps)
+            motion = self.p_sample(model, motion, conditioning, timesteps, add_noise=add_noise)
         return motion

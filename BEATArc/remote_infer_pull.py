@@ -72,6 +72,14 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         command += f" --model-type {remote_quote(args.model_type)}"
     if args.seed is not None:
         command += f" --seed {remote_quote(str(args.seed))}"
+    if args.diffusion_deterministic:
+        command += " --diffusion-deterministic"
+    if args.smooth_window != 1:
+        command += f" --smooth-window {remote_quote(str(args.smooth_window))}"
+    if args.velocity_limit:
+        command += " --velocity-limit"
+    if args.velocity_scale != 1.0:
+        command += f" --velocity-scale {remote_quote(str(args.velocity_scale))}"
     if args.text_cpu:
         command += " --text-cpu"
     return command
@@ -168,6 +176,14 @@ def main():
                         help="Inference stride in seconds")
     parser.add_argument("--seed", type=int, default=None,
                         help="Optional random seed for remote diffusion sampling")
+    parser.add_argument("--diffusion-deterministic", action="store_true",
+                        help="Use posterior means during remote diffusion sampling")
+    parser.add_argument("--smooth-window", type=int, default=1,
+                        help="Remote output moving-average smoothing window in frames")
+    parser.add_argument("--velocity-limit", action="store_true",
+                        help="Apply NAO joint velocity limiting to remote output")
+    parser.add_argument("--velocity-scale", type=float, default=1.0,
+                        help="Scale applied to NAO velocity limits")
     parser.add_argument("--local-dir", default="nao_predictions",
                         help="Local destination directory")
     parser.add_argument("--remote-python", default="python",

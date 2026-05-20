@@ -49,7 +49,7 @@ def diffusion_model_init_kwargs(model_config: dict) -> dict:
 
 try:
     from .config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
-    from .nao_constants import NAO_JOINTS, NAO_LIMITS
+    from .nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
     from .parse_annotations import parse_textgrid
     from .preprocess_nao import (
         PROSODY_FEATURE_NAMES,
@@ -60,7 +60,7 @@ try:
     )
 except ImportError:
     from config import AUDIO_DIR, AUDIO_SR, MOCAP_FPS, TEXTGRID_DIR
-    from nao_constants import NAO_JOINTS, NAO_LIMITS
+    from nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
     from parse_annotations import parse_textgrid
     from preprocess_nao import (
         PROSODY_FEATURE_NAMES,
@@ -137,12 +137,33 @@ def validate_inference_contract(model_config: dict, stats: dict, dataset_metadat
     if missing:
         raise ValueError(f"Stats file is missing required keys: {missing}")
 
+    stats_joint_names = stats.get("nao_joint_names")
+    if stats_joint_names is not None and list(stats_joint_names) != list(NAO_JOINTS):
+        raise ValueError(
+            f"Stats NAO joint order does not match inference order: {stats_joint_names}"
+        )
+    stats_feature_names = stats.get("prosody_feature_names")
+    if stats_feature_names is not None and list(stats_feature_names) != list(PROSODY_FEATURE_NAMES):
+        raise ValueError(
+            f"Stats prosody feature order does not match inference order: {stats_feature_names}"
+        )
+
     if tuple(model_config.get("target_shape", ())) != (len(NAO_JOINTS),):
         raise ValueError(
             f"Expected NAO target_shape ({len(NAO_JOINTS)},), "
             f"got {model_config.get('target_shape')}"
         )
     if dataset_metadata:
+        metadata_targets = dataset_metadata.get("target_names")
+        if metadata_targets is not None and list(metadata_targets) != list(NAO_JOINTS):
+            raise ValueError(
+                f"Checkpoint target_names do not match inference order: {metadata_targets}"
+            )
+        metadata_features = dataset_metadata.get("feature_names")
+        if metadata_features is not None and list(metadata_features) != list(PROSODY_FEATURE_NAMES):
+            raise ValueError(
+                f"Checkpoint feature_names do not match inference order: {metadata_features}"
+            )
         metadata_shape = tuple(dataset_metadata.get("target_shape", ()))
         if metadata_shape and metadata_shape != tuple(model_config["target_shape"]):
             raise ValueError(
@@ -168,10 +189,22 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
     prosody = extract_prosody(wav_path, target_frames, fps=fps, sample_rate=AUDIO_SR)
     prosody_mean = np.array(stats["prosody_mean"], dtype=np.float32)
     prosody_std = np.array(stats["prosody_std"], dtype=np.float32)
+    if prosody_mean.shape != (len(PROSODY_FEATURE_NAMES),) or prosody_std.shape != (
+        len(PROSODY_FEATURE_NAMES),
+    ):
+        raise ValueError(
+            "Stats prosody mean/std shape does not match expected prosody feature count "
+            f"({len(PROSODY_FEATURE_NAMES)})"
+        )
     prosody = (prosody - prosody_mean) / prosody_std
 
     expected_input_dim = int(model_config.get("input_dim", prosody.shape[1]))
     text_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES)
+    if text_dim < 0:
+        raise ValueError(
+            f"Checkpoint input_dim {expected_input_dim} is smaller than prosody dim "
+            f"{len(PROSODY_FEATURE_NAMES)}"
+        )
     if text_dim == 0:
         return prosody.astype(np.float32)
     if text_dim != TEXT_EMBED_DIM:
@@ -202,6 +235,13 @@ def window_starts(total_frames: int, window_frames: int, stride_frames: int) -> 
     return starts
 
 
+def overlap_weights(window_frames: int) -> torch.Tensor:
+    if window_frames <= 2:
+        return torch.ones((window_frames,), dtype=torch.float32)
+    weights = torch.hann_window(window_frames, periodic=False, dtype=torch.float32)
+    return weights.clamp(min=0.05)
+
+
 def run_inference(model, features: np.ndarray, window_frames: int,
                   stride_frames: int, device: torch.device) -> np.ndarray:
     total_frames = features.shape[0]
@@ -214,6 +254,7 @@ def run_inference(model, features: np.ndarray, window_frames: int,
         pad = np.repeat(features[-1:], window_frames - total_frames, axis=0)
         padded_features = np.concatenate([features, pad], axis=0)
 
+    weights = overlap_weights(window_frames).reshape(window_frames, *((1,) * len(target_shape)))
     model.eval()
     with torch.no_grad():
         for start in window_starts(total_frames, window_frames, stride_frames):
@@ -223,14 +264,15 @@ def run_inference(model, features: np.ndarray, window_frames: int,
             pred = model(x).squeeze(0).cpu()
             valid_end = min(end, total_frames)
             valid_len = valid_end - start
-            pred_sum[start:valid_end] += pred[:valid_len]
-            pred_count[start:valid_end] += 1
+            pred_sum[start:valid_end] += pred[:valid_len] * weights[:valid_len]
+            pred_count[start:valid_end] += weights[:valid_len]
 
     return (pred_sum / pred_count.clamp(min=1)).numpy()
 
 
 def run_diffusion_inference(model, schedule, features: np.ndarray, window_frames: int,
-                            stride_frames: int, device: torch.device) -> np.ndarray:
+                            stride_frames: int, device: torch.device,
+                            deterministic: bool = False) -> np.ndarray:
     total_frames = features.shape[0]
     target_shape = tuple(model.target_shape)
     pred_sum = torch.zeros((total_frames, *target_shape), dtype=torch.float32)
@@ -242,6 +284,7 @@ def run_diffusion_inference(model, schedule, features: np.ndarray, window_frames
         padded_features = np.concatenate([features, pad], axis=0)
 
     starts = window_starts(total_frames, window_frames, stride_frames)
+    weights = overlap_weights(window_frames).reshape(window_frames, *((1,) * len(target_shape)))
     print(f"[DIFFUSION] Sampling {len(starts)} windows x {schedule.timesteps} steps")
     model.eval()
     with torch.no_grad():
@@ -249,11 +292,13 @@ def run_diffusion_inference(model, schedule, features: np.ndarray, window_frames
             end = start + window_frames
             x_np = padded_features[start:end]
             conditioning = torch.from_numpy(x_np).unsqueeze(0).to(device)
-            pred = schedule.sample(model, conditioning, target_shape).squeeze(0).cpu()
+            pred = schedule.sample(
+                model, conditioning, target_shape, add_noise=not deterministic
+            ).squeeze(0).cpu()
             valid_end = min(end, total_frames)
             valid_len = valid_end - start
-            pred_sum[start:valid_end] += pred[:valid_len]
-            pred_count[start:valid_end] += 1
+            pred_sum[start:valid_end] += pred[:valid_len] * weights[:valid_len]
+            pred_count[start:valid_end] += weights[:valid_len]
             if window_idx == 1 or window_idx == len(starts) or window_idx % 10 == 0:
                 print(f"[DIFFUSION] Window {window_idx}/{len(starts)}")
 
@@ -271,6 +316,37 @@ def clamp_nao_angles(angles: np.ndarray) -> np.ndarray:
     for joint_idx, name in enumerate(NAO_JOINTS):
         low, high = NAO_LIMITS[name]
         out[:, joint_idx] = np.clip(out[:, joint_idx], low, high)
+    return out
+
+
+def smooth_nao_angles(angles: np.ndarray, window_frames: int) -> np.ndarray:
+    if window_frames <= 1 or len(angles) <= 2:
+        return angles
+    window_frames = min(int(window_frames), len(angles))
+    if window_frames <= 1:
+        return angles
+
+    kernel = np.ones(window_frames, dtype=np.float32) / float(window_frames)
+    pad_left = window_frames // 2
+    pad_right = window_frames - 1 - pad_left
+    padded = np.pad(angles, ((pad_left, pad_right), (0, 0)), mode="edge")
+    smoothed = np.empty_like(angles, dtype=np.float32)
+    for joint_idx in range(angles.shape[1]):
+        smoothed[:, joint_idx] = np.convolve(padded[:, joint_idx], kernel, mode="valid")
+    return smoothed
+
+
+def limit_nao_velocity(angles: np.ndarray, fps: int, scale: float = 1.0) -> np.ndarray:
+    if len(angles) <= 1:
+        return angles
+    out = angles.copy()
+    frame_time = 1.0 / fps
+    for frame_idx in range(1, len(out)):
+        for joint_idx, name in enumerate(NAO_JOINTS):
+            max_change = NAO_MAX_VEL.get(name, 5.0) * scale * frame_time
+            diff = out[frame_idx, joint_idx] - out[frame_idx - 1, joint_idx]
+            if abs(diff) > max_change:
+                out[frame_idx, joint_idx] = out[frame_idx - 1, joint_idx] + np.sign(diff) * max_change
     return out
 
 
@@ -319,6 +395,14 @@ def main():
     parser.add_argument("--stride", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=None,
                         help="Optional random seed for diffusion sampling")
+    parser.add_argument("--diffusion-deterministic", action="store_true",
+                        help="Use posterior means during diffusion sampling instead of adding reverse noise")
+    parser.add_argument("--smooth-window", type=int, default=1,
+                        help="Moving-average smoothing window in frames after denormalization; 1 disables")
+    parser.add_argument("--velocity-limit", action="store_true",
+                        help="Clamp frame-to-frame output changes to NAO joint velocity limits")
+    parser.add_argument("--velocity-scale", type=float, default=1.0,
+                        help="Scale applied to NAO velocity limits when --velocity-limit is used")
     parser.add_argument("--text-cpu", action="store_true",
                         help="Run DistilBERT text embedding on CPU")
     args = parser.parse_args()
@@ -362,6 +446,10 @@ def main():
     stride_frames = int(round(args.stride * args.fps))
     if window_frames <= 0 or stride_frames <= 0:
         raise ValueError("--window-size and --stride must produce at least one frame")
+    if args.smooth_window < 1:
+        raise ValueError("--smooth-window must be at least 1")
+    if args.velocity_scale <= 0:
+        raise ValueError("--velocity-scale must be positive")
 
     if model_type == "diffusion":
         diffusion_config = checkpoint.get("diffusion_config")
@@ -371,7 +459,13 @@ def main():
         model.load_state_dict(state_dict)
         schedule = DiffusionSchedule(**diffusion_config).to(device)
         pred_norm = run_diffusion_inference(
-            model, schedule, features, window_frames, stride_frames, device
+            model,
+            schedule,
+            features,
+            window_frames,
+            stride_frames,
+            device,
+            deterministic=args.diffusion_deterministic,
         )
     else:
         model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
@@ -379,7 +473,13 @@ def main():
         pred_norm = run_inference(model, features, window_frames, stride_frames, device)
 
     pred_angles = reconstruct_nao_angles(pred_norm, stats, target_mode).astype(np.float32)
+    pred_angles = smooth_nao_angles(pred_angles, args.smooth_window).astype(np.float32)
     pred_angles = clamp_nao_angles(pred_angles).astype(np.float32)
+    if args.velocity_limit:
+        pred_angles = limit_nao_velocity(
+            pred_angles, args.fps, scale=args.velocity_scale
+        ).astype(np.float32)
+        pred_angles = clamp_nao_angles(pred_angles).astype(np.float32)
 
     np.save(output_path, pred_angles)
     print(f"[OUT] Saved:       {output_path}")
@@ -396,6 +496,10 @@ def main():
         "stride": args.stride,
         "model_type": model_type,
         "seed": args.seed,
+        "diffusion_deterministic": args.diffusion_deterministic,
+        "smooth_window": args.smooth_window,
+        "velocity_limit": args.velocity_limit,
+        "velocity_scale": args.velocity_scale,
         "num_frames": int(pred_angles.shape[0]),
         "duration_sec": float(pred_angles.shape[0] / args.fps),
         "nao_joint_names": NAO_JOINTS,

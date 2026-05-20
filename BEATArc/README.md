@@ -66,6 +66,9 @@ python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 \
   --model-type diffusion \
   --checkpoint /vol/bitbucket/ap1922/path/to/diffusion_best.pth \
   --stats /vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed/normalization_stats.json \
+  --diffusion-deterministic \
+  --smooth-window 9 \
+  --velocity-limit \
   --seed 42
 ```
 
@@ -80,7 +83,10 @@ python BEATArc/infer_nao.py \
   --clip-id 10_kieks_0_103_103 \
   --audio-dir /path/to/beat_english_v2.0.0/wave16k \
   --textgrid-dir /path/to/beat_english_v2.0.0/textgrid \
-  --output nao_predictions/10_kieks_0_103_103.npy
+  --output nao_predictions/10_kieks_0_103_103.npy \
+  --diffusion-deterministic \
+  --smooth-window 9 \
+  --velocity-limit
 ```
 
 `infer_nao.py` auto-detects diffusion checkpoints that contain

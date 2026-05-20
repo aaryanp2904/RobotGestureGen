@@ -49,6 +49,20 @@ def metadata_model_config(metadata: dict, args) -> dict:
     }
 
 
+def metadata_training_contract(metadata: dict) -> dict:
+    """Fields that must agree between train/validation datasets and inference stats."""
+    return {
+        "input_dim": int(metadata.get("input_dim", 1536)),
+        "target_shape": tuple(metadata.get("target_shape", [12, 3])),
+        "target_mode": metadata.get("target_mode", "angle"),
+        "target_type": metadata.get("target_type", "unknown"),
+        "feature_names": list(metadata.get("feature_names", [])),
+        "target_names": list(metadata.get("target_names", [])),
+        "prosody_dim": metadata.get("prosody_dim"),
+        "text_dim": metadata.get("text_dim"),
+    }
+
+
 def make_dataloader(dataset, args, shuffle: bool) -> DataLoader:
     return DataLoader(
         dataset,
@@ -99,6 +113,18 @@ def diffusion_loss(
     conditioning: torch.Tensor,
     clean_motion: torch.Tensor,
 ) -> torch.Tensor:
+    if conditioning.ndim != 3:
+        raise ValueError(f"Expected conditioning shape (B, T, C), got {tuple(conditioning.shape)}")
+    if conditioning.shape[-1] != model.input_dim:
+        raise ValueError(
+            f"Expected conditioning dim {model.input_dim}, got {conditioning.shape[-1]}"
+        )
+    if tuple(clean_motion.shape[1:]) != (conditioning.shape[1], *model.target_shape):
+        raise ValueError(
+            f"Expected clean motion shape (B, {conditioning.shape[1]}, {model.target_shape}), "
+            f"got {tuple(clean_motion.shape)}"
+        )
+
     batch_size = clean_motion.shape[0]
     timesteps = torch.randint(
         0,
@@ -215,6 +241,7 @@ def train(args):
     train_dataset = PreprocessedGestureDataset(args.data_dir)
     validate_args_and_data(args, train_dataset, label="training")
     model_config = metadata_model_config(train_dataset.metadata, args)
+    training_contract = metadata_training_contract(train_dataset.metadata)
     diffusion_config = {
         "timesteps": args.diffusion_steps,
         "beta_start": args.beta_start,
@@ -238,11 +265,12 @@ def train(args):
     if val_data_dir and not args.sanity_check:
         val_dataset = PreprocessedGestureDataset(val_data_dir)
         validate_args_and_data(args, val_dataset, label="validation")
-        val_config = metadata_model_config(val_dataset.metadata, args)
-        if val_config["input_dim"] != model_config["input_dim"] or (
-            val_config["target_shape"] != model_config["target_shape"]
-        ):
-            raise ValueError(f"Validation metadata does not match train metadata: {val_config}")
+        val_contract = metadata_training_contract(val_dataset.metadata)
+        if val_contract != training_contract:
+            raise ValueError(
+                f"Validation metadata does not match training metadata: "
+                f"{val_contract} vs {training_contract}"
+            )
         val_loader = make_dataloader(val_dataset, args, shuffle=False)
         print(f"[VAL] {len(val_dataset)} validation windows", flush=True)
 
