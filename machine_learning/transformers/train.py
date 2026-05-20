@@ -5,6 +5,7 @@ Usage:
     python train.py --data-dir /path/to/dataset.lmdb --epochs 50
     python train.py --data-dir /path/to/train.lmdb --val-data-dir /path/to/val.lmdb
     python train.py --data-dir /path/to/dataset.lmdb --sanity-check
+    python train.py --data-dir /path/to/train.lmdb --velocity-loss-weight 2.0
 """
 
 import torch
@@ -92,7 +93,9 @@ class PreprocessedLMDBDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 def train_model(dataloader, epochs=50, sanity_check=False, device=None,
-                model_config=None, val_dataloader=None, checkpoint_dir="."):
+                model_config=None, val_dataloader=None, checkpoint_dir=".",
+                velocity_loss_weight=0.0, acceleration_loss_weight=0.0,
+                log_every=100):
     """Train or sanity-check the GestureTransformer."""
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -104,7 +107,10 @@ def train_model(dataloader, epochs=50, sanity_check=False, device=None,
         model_config = {}
     model = GestureTransformer(**model_config).to(device)
     model.config = dict(model_config)
-    criterion = nn.MSELoss()
+    criterion = MotionLoss(
+        velocity_weight=velocity_loss_weight,
+        acceleration_weight=acceleration_loss_weight,
+    )
     lr = 1e-3 if sanity_check else 1e-4
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
@@ -116,9 +122,38 @@ def train_model(dataloader, epochs=50, sanity_check=False, device=None,
             model, criterion, optimizer, scaler, dataloader, epochs, device,
             val_dataloader=val_dataloader,
             checkpoint_dir=Path(checkpoint_dir),
+            log_every=log_every,
         )
 
     return model
+
+
+class MotionLoss(nn.Module):
+    """Pose MSE plus optional velocity/acceleration MSE over the time axis."""
+
+    def __init__(self, velocity_weight=0.0, acceleration_weight=0.0):
+        super().__init__()
+        self.velocity_weight = float(velocity_weight)
+        self.acceleration_weight = float(acceleration_weight)
+        self.mse = nn.MSELoss()
+
+    def forward(self, pred, target):
+        pose_loss = self.mse(pred, target)
+        total = pose_loss
+
+        if self.velocity_weight > 0 and pred.shape[1] > 1:
+            pred_vel = pred[:, 1:] - pred[:, :-1]
+            target_vel = target[:, 1:] - target[:, :-1]
+            total = total + self.velocity_weight * self.mse(pred_vel, target_vel)
+
+        if self.acceleration_weight > 0 and pred.shape[1] > 2:
+            pred_vel = pred[:, 1:] - pred[:, :-1]
+            target_vel = target[:, 1:] - target[:, :-1]
+            pred_acc = pred_vel[:, 1:] - pred_vel[:, :-1]
+            target_acc = target_vel[:, 1:] - target_vel[:, :-1]
+            total = total + self.acceleration_weight * self.mse(pred_acc, target_acc)
+
+        return total
 
 
 def _sanity_check(model, criterion, optimizer, scaler, dataloader, device):
@@ -178,9 +213,15 @@ def _save_checkpoint(path, model, model_config, epoch, train_loss, val_loss=None
 
 
 def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
-                val_dataloader=None, checkpoint_dir=Path(".")):
+                val_dataloader=None, checkpoint_dir=Path("."), log_every=100):
     """Standard epoch-based training loop with AMP."""
     print(f"\n[TRAIN] {epochs} epochs, {len(dataloader)} batches/epoch\n", flush=True)
+    if isinstance(criterion, MotionLoss):
+        print(
+            f"[LOSS] pose_mse + {criterion.velocity_weight:g}*velocity_mse "
+            f"+ {criterion.acceleration_weight:g}*acceleration_mse\n",
+            flush=True,
+        )
     if val_dataloader is not None:
         print(f"[VAL] {len(val_dataloader)} validation batches/epoch\n", flush=True)
 
@@ -192,8 +233,15 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
         model.train()
         total_loss = 0.0
         t0 = time.time()
+        print(f"[TRAIN] Epoch {epoch+1}: loading first batch...", flush=True)
 
         for batch_idx, (bx, by) in enumerate(dataloader):
+            if batch_idx == 0:
+                print(
+                    f"[TRAIN] Epoch {epoch+1}: first batch loaded "
+                    f"X={tuple(bx.shape)} Y={tuple(by.shape)}",
+                    flush=True,
+                )
             bx = bx.to(device, non_blocking=True)
             by = by.to(device, non_blocking=True)
 
@@ -207,8 +255,12 @@ def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
             scaler.update()
 
             total_loss += loss.item()
-            if (batch_idx + 1) % 100 == 0:
-                print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | Loss: {loss.item():.6f}")
+            if (batch_idx + 1) == 1 or (batch_idx + 1) % log_every == 0:
+                print(
+                    f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} "
+                    f"| Loss: {loss.item():.6f}",
+                    flush=True,
+                )
 
         avg = total_loss / len(dataloader)
         val_loss = _evaluate(model, criterion, val_dataloader, device)
@@ -258,10 +310,18 @@ if __name__ == "__main__":
                         help="Optional path to validation .lmdb directory")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="DataLoader worker processes for LMDB reads")
+    parser.add_argument("--log-every", type=int, default=25,
+                        help="Print training progress every N batches")
     parser.add_argument("--output-dir", type=str, default=".",
                         help="Directory for latest/best/final checkpoints")
     parser.add_argument("--sanity-check", action="store_true",
                         help="Overfit single batch to verify model learns")
+    parser.add_argument("--velocity-loss-weight", type=float, default=0.0,
+                        help="Weight for frame-to-frame velocity MSE loss")
+    parser.add_argument("--acceleration-loss-weight", type=float, default=0.0,
+                        help="Weight for second-difference acceleration MSE loss")
     args = parser.parse_args()
 
     dataset = PreprocessedLMDBDataset(args.data_dir)
@@ -271,9 +331,14 @@ if __name__ == "__main__":
     }
     dataloader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=0, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=True,
+        persistent_workers=args.num_workers > 0,
     )
-    print(f"[MAIN] {len(dataloader)} batches (batch_size={args.batch_size})\n", flush=True)
+    print(
+        f"[MAIN] {len(dataloader)} batches "
+        f"(batch_size={args.batch_size}, num_workers={args.num_workers})\n",
+        flush=True,
+    )
 
     val_dataloader = None
     if not args.sanity_check:
@@ -297,12 +362,20 @@ if __name__ == "__main__":
                 )
             val_dataloader = DataLoader(
                 val_dataset, batch_size=args.batch_size, shuffle=False,
-                num_workers=0, pin_memory=True,
+                num_workers=args.num_workers, pin_memory=True,
+                persistent_workers=args.num_workers > 0,
             )
             print(f"[MAIN] {len(val_dataloader)} validation batches\n", flush=True)
 
     if args.sanity_check:
-        train_model(dataloader, sanity_check=True, model_config=model_config)
+        train_model(
+            dataloader,
+            sanity_check=True,
+            model_config=model_config,
+            velocity_loss_weight=args.velocity_loss_weight,
+            acceleration_loss_weight=args.acceleration_loss_weight,
+            log_every=args.log_every,
+        )
     else:
         train_model(
             dataloader,
@@ -310,4 +383,7 @@ if __name__ == "__main__":
             model_config=model_config,
             val_dataloader=val_dataloader,
             checkpoint_dir=args.output_dir,
+            velocity_loss_weight=args.velocity_loss_weight,
+            acceleration_loss_weight=args.acceleration_loss_weight,
+            log_every=args.log_every,
         )
