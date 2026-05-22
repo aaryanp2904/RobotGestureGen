@@ -23,6 +23,26 @@ Pick a random clip:
 python BEATArc/BEATDemo.py --random --server http://localhost:8000
 ```
 
+Fetch a datapoint from the remote BEAT2 dataset, copy its WAV locally, and
+export the original motion as NAO joint angles:
+
+```bash
+python BEATArc/fetch_nao_datapoint.py 10_kieks_0_103_103
+```
+
+Fetch, convert, and play it on the local NAO server:
+
+```bash
+python BEATArc/fetch_nao_datapoint.py 10_kieks_0_103_103 --play --server http://localhost:8000
+```
+
+Outputs are written under `nao_datapoints/<tag>/`:
+
+- `<tag>.wav`: copied dataset audio,
+- `<tag>.npz`: copied source motion,
+- `<tag>.npy`: converted NAO angle sequence in `NAO_JOINTS` order,
+- `<tag>.json`: metadata including FPS, frame window, duration, and joint order.
+
 ## NAO Training Preprocessing
 
 Create split-specific LMDBs and normalization stats:
@@ -117,6 +137,7 @@ python BEATArc/play_nao_predictions.py \
 ## Active Files
 
 - `BEATDemo.py`: map BEAT2 SMPL-X clips to NAO motion via IK and stream them.
+- `fetch_nao_datapoint.py`: pull remote dataset clips locally and export/play original motion in NAO space.
 - `preprocess_nao.py`: build prosody/text features and direct NAO joint targets.
 - `infer_nao.py`: generate NAO joint-angle predictions from WAV/TextGrid input.
 - `play_nao_predictions.py`: play generated predictions on the local NAO server.
