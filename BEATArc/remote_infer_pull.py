@@ -28,6 +28,8 @@ DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
 DEFAULT_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Checkpoints/gesture_transformer_best.pth"
 DEFAULT_DIFFUSION_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Diffusion_Checkpoints/diffusion_best.pth"
 DEFAULT_STATS = "/vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed/normalization_stats.json"
+DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
+DEFAULT_SSH_CONTROL_PERSIST = "10m"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -43,8 +45,32 @@ def remote_quote(value: str) -> str:
     return shlex.quote(value)
 
 
-def ssh_command(remote: str, remote_command: str, jump_host: str = "") -> list[str]:
+def ssh_reuse_options(args) -> list[str]:
+    if args.no_ssh_reuse:
+        return []
+    return [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPersist={args.ssh_control_persist}",
+        "-o", f"ControlPath={args.ssh_control_path}",
+    ]
+
+
+def ensure_ssh_control_dir(args):
+    if args.no_ssh_reuse or args.dry_run:
+        return
+    control_path = Path(args.ssh_control_path).expanduser()
+    control_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def ssh_command(
+    remote: str,
+    remote_command: str,
+    jump_host: str = "",
+    ssh_options: list[str] | None = None,
+) -> list[str]:
     command = ["ssh"]
+    if ssh_options:
+        command.extend(ssh_options)
     if jump_host:
         command.extend(["-J", jump_host])
     command.extend([remote, remote_command])
@@ -99,9 +125,12 @@ def scp_from_remote(
     remote_path: str,
     local_dir: Path,
     jump_host: str = "",
+    ssh_options: list[str] | None = None,
     dry_run=False,
 ):
     command = ["scp"]
+    if ssh_options:
+        command.extend(ssh_options)
     if jump_host:
         command.extend(["-o", f"ProxyJump={jump_host}"])
     command.extend([f"{remote}:{remote_path}", str(local_dir)])
@@ -114,13 +143,19 @@ def copy_from_remote(args, remote_path: str, local_dir: Path):
         remote_path,
         local_dir,
         jump_host=args.jump_host,
+        ssh_options=ssh_reuse_options(args),
         dry_run=args.dry_run,
     )
 
 
 def run_remote_command(args, remote_command: str):
     run_command(
-        ssh_command(args.remote, remote_command, jump_host=args.jump_host),
+        ssh_command(
+            args.remote,
+            remote_command,
+            jump_host=args.jump_host,
+            ssh_options=ssh_reuse_options(args),
+        ),
         dry_run=args.dry_run,
     )
 
@@ -218,6 +253,12 @@ def main():
                         help="Run remote text embedding on CPU")
     parser.add_argument("--wavlm-cpu", action="store_true",
                         help="Run remote WavLM embedding on CPU")
+    parser.add_argument("--no-ssh-reuse", action="store_true",
+                        help="Disable SSH connection reuse between remote commands")
+    parser.add_argument("--ssh-control-path", default=DEFAULT_SSH_CONTROL_PATH,
+                        help="OpenSSH ControlPath used for connection reuse")
+    parser.add_argument("--ssh-control-persist", default=DEFAULT_SSH_CONTROL_PERSIST,
+                        help="How long the reusable SSH connection stays open after use")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print ssh/scp commands without running them")
     args = parser.parse_args()
@@ -227,6 +268,7 @@ def main():
         raise ValueError("--sample-steps must be positive")
     if args.guidance_scale < 0:
         raise ValueError("--guidance-scale cannot be negative")
+    ensure_ssh_control_dir(args)
 
     local_dir = Path(args.local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)

@@ -66,6 +66,14 @@ Run inference on `oak11.doc.ic.ac.uk` from your local machine and pull outputs:
 python BEATArc/remote_infer_pull.py 10_kieks_0_103_103
 ```
 
+By default, the helper reuses one SSH connection for the remote inference and
+subsequent `scp` pulls, so password-based logins should only prompt once per
+run. If multiplexing causes trouble on a host, disable it:
+
+```bash
+python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 --no-ssh-reuse
+```
+
 Run inference, pull outputs, and start local playback:
 
 ```bash
