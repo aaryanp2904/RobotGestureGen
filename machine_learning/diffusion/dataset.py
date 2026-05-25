@@ -23,6 +23,9 @@ DEFAULT_METADATA = {
     "input_dim": 1536,
     "target_shape": [12, 3],
     "target_type": "genea_root_relative_xyz",
+    "target_representation": "unknown",
+    "speaker_dim": 0,
+    "has_valid_mask": False,
 }
 
 
@@ -100,6 +103,8 @@ class PreprocessedGestureDataset(Dataset):
                     "input_dim": int(raw["x"].shape[-1]),
                     "target_shape": list(raw["y"].shape[1:]),
                     "window_frames": int(raw["x"].shape[0]),
+                    "speaker_dim": int(raw.get("speaker", np.zeros((0,))).shape[-1]),
+                    "has_valid_mask": "valid_mask" in raw,
                 })
         env.close()
 
@@ -135,16 +140,31 @@ class PreprocessedGestureDataset(Dataset):
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if self.kind == "lmdb":
             with self._get_env().begin() as txn:
                 value = txn.get(f"{idx:08d}".encode())
             if value is None:
                 raise KeyError(f"Key {idx:08d} not found in {self.data_dir}")
             raw = pickle.loads(value)
-            return _as_float_tensor(raw["x"]), _as_float_tensor(raw["y"])
+            speaker = raw.get("speaker")
+            if speaker is None:
+                speaker = np.zeros((int(self.metadata.get("speaker_dim", 0)),), dtype=np.float32)
+            valid_mask = raw.get("valid_mask")
+            if valid_mask is None:
+                valid_mask = np.ones((raw["y"].shape[0], 1), dtype=np.float32)
+            return (
+                _as_float_tensor(raw["x"]),
+                _as_float_tensor(raw["y"]),
+                _as_float_tensor(speaker),
+                _as_float_tensor(valid_mask),
+            )
 
+        x = _as_float_tensor(torch.load(self.x_files[idx], map_location="cpu"))
+        y = _as_float_tensor(torch.load(self.y_files[idx], map_location="cpu"))
         return (
-            _as_float_tensor(torch.load(self.x_files[idx], map_location="cpu")),
-            _as_float_tensor(torch.load(self.y_files[idx], map_location="cpu")),
+            x,
+            y,
+            torch.zeros((int(self.metadata.get("speaker_dim", 0)),), dtype=torch.float32),
+            torch.ones((y.shape[0], 1), dtype=torch.float32),
         )

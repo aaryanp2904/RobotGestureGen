@@ -26,6 +26,7 @@ DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
 DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
 DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
 DEFAULT_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Checkpoints/gesture_transformer_best.pth"
+DEFAULT_DIFFUSION_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Diffusion_Checkpoints/diffusion_best.pth"
 DEFAULT_STATS = "/vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed/normalization_stats.json"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -74,6 +75,12 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         command += f" --seed {remote_quote(str(args.seed))}"
     if args.diffusion_deterministic:
         command += " --diffusion-deterministic"
+    if args.sampler != "ddpm":
+        command += f" --sampler {remote_quote(args.sampler)}"
+    if args.sample_steps != 50:
+        command += f" --sample-steps {remote_quote(str(args.sample_steps))}"
+    if args.guidance_scale != 1.0:
+        command += f" --guidance-scale {remote_quote(str(args.guidance_scale))}"
     if args.smooth_window != 1:
         command += f" --smooth-window {remote_quote(str(args.smooth_window))}"
     if args.velocity_limit:
@@ -82,6 +89,8 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         command += f" --velocity-scale {remote_quote(str(args.velocity_scale))}"
     if args.text_cpu:
         command += " --text-cpu"
+    if args.wavlm_cpu:
+        command += " --wavlm-cpu"
     return command
 
 
@@ -165,6 +174,8 @@ def main():
                         help="Remote directory for generated prediction files")
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT,
                         help="Remote model checkpoint path")
+    parser.add_argument("--diffusion-checkpoint", default=DEFAULT_DIFFUSION_CHECKPOINT,
+                        help="Remote diffusion checkpoint path used when --model-type diffusion and --checkpoint is not set")
     parser.add_argument("--stats", default=DEFAULT_STATS,
                         help="Remote normalization_stats.json path")
     parser.add_argument("--model-type", choices=["auto", "transformer", "diffusion"],
@@ -178,6 +189,12 @@ def main():
                         help="Optional random seed for remote diffusion sampling")
     parser.add_argument("--diffusion-deterministic", action="store_true",
                         help="Use posterior means during remote diffusion sampling")
+    parser.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddpm",
+                        help="Remote diffusion sampler")
+    parser.add_argument("--sample-steps", type=int, default=50,
+                        help="Number of DDIM sample steps for remote diffusion inference")
+    parser.add_argument("--guidance-scale", type=float, default=1.0,
+                        help="Classifier-free guidance scale for remote diffusion inference")
     parser.add_argument("--smooth-window", type=int, default=1,
                         help="Remote output moving-average smoothing window in frames")
     parser.add_argument("--velocity-limit", action="store_true",
@@ -199,9 +216,17 @@ def main():
                         help="After copying files, run local playback immediately")
     parser.add_argument("--text-cpu", action="store_true",
                         help="Run remote text embedding on CPU")
+    parser.add_argument("--wavlm-cpu", action="store_true",
+                        help="Run remote WavLM embedding on CPU")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print ssh/scp commands without running them")
     args = parser.parse_args()
+    if args.model_type == "diffusion" and args.checkpoint == DEFAULT_CHECKPOINT:
+        args.checkpoint = args.diffusion_checkpoint
+    if args.sample_steps <= 0:
+        raise ValueError("--sample-steps must be positive")
+    if args.guidance_scale < 0:
+        raise ValueError("--guidance-scale cannot be negative")
 
     local_dir = Path(args.local_dir)
     local_dir.mkdir(parents=True, exist_ok=True)

@@ -46,6 +46,15 @@ def metadata_model_config(metadata: dict, args) -> dict:
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "max_frames": args.max_frames,
+        "speaker_dim": int(metadata.get("speaker_dim", 0)),
+        "seed_conditioning": args.seed_frames > 0,
+        "seed_frames": args.seed_frames,
+        "conditioning_layers": args.conditioning_layers,
+        "conditioning_encoder": "transformer",
+        "cross_attention": True,
+        "cond_drop_prob": args.cond_drop_prob,
+        "target_mode": metadata.get("target_mode", "angle"),
+        "target_representation": metadata.get("target_representation", "unknown"),
     }
 
 
@@ -56,10 +65,15 @@ def metadata_training_contract(metadata: dict) -> dict:
         "target_shape": tuple(metadata.get("target_shape", [12, 3])),
         "target_mode": metadata.get("target_mode", "angle"),
         "target_type": metadata.get("target_type", "unknown"),
+        "target_representation": metadata.get("target_representation", "unknown"),
         "feature_names": list(metadata.get("feature_names", [])),
         "target_names": list(metadata.get("target_names", [])),
         "prosody_dim": metadata.get("prosody_dim"),
+        "wavlm_dim": metadata.get("wavlm_dim"),
+        "wavlm_model": metadata.get("wavlm_model"),
         "text_dim": metadata.get("text_dim"),
+        "speaker_dim": metadata.get("speaker_dim", 0),
+        "speaker_id_map": dict(metadata.get("speaker_id_map", {})),
     }
 
 
@@ -78,7 +92,7 @@ def dataset_window_frames(dataset: PreprocessedGestureDataset) -> int:
     for key in ("window_frames", "window_size_frames"):
         if key in dataset.metadata:
             return int(dataset.metadata[key])
-    sample_x, _ = dataset[0]
+    sample_x = dataset[0][0]
     return int(sample_x.shape[0])
 
 
@@ -91,6 +105,8 @@ def validate_args_and_data(args, dataset: PreprocessedGestureDataset, label: str
         raise ValueError("--batch-size must be positive")
     if args.num_workers < 0:
         raise ValueError("--num-workers cannot be negative")
+    if args.conditioning_layers < 0:
+        raise ValueError("--conditioning-layers cannot be negative")
     if args.log_every <= 0:
         raise ValueError("--log-every must be positive")
     if args.sanity_check and args.sanity_steps <= 0:
@@ -99,7 +115,16 @@ def validate_args_and_data(args, dataset: PreprocessedGestureDataset, label: str
         raise ValueError("--learning-rate must be positive")
     if args.weight_decay < 0:
         raise ValueError("--weight-decay cannot be negative")
+    if not 0.0 <= args.cond_drop_prob < 1.0:
+        raise ValueError("--cond-drop-prob must be in [0, 1)")
+    if args.seed_frames < 0:
+        raise ValueError("--seed-frames cannot be negative")
     window_frames = dataset_window_frames(dataset)
+    if args.seed_frames >= window_frames:
+        raise ValueError(
+            f"--seed-frames={args.seed_frames} must be smaller than the dataset window "
+            f"length ({window_frames} frames)"
+        )
     if args.max_frames < window_frames:
         raise ValueError(
             f"--max-frames={args.max_frames} is shorter than the dataset window "
@@ -112,6 +137,12 @@ def diffusion_loss(
     schedule: DiffusionSchedule,
     conditioning: torch.Tensor,
     clean_motion: torch.Tensor,
+    speaker: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+    seed_frames: int = 0,
+    cond_drop_prob: float = 0.0,
+    timesteps: torch.Tensor | None = None,
+    noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if conditioning.ndim != 3:
         raise ValueError(f"Expected conditioning shape (B, T, C), got {tuple(conditioning.shape)}")
@@ -126,17 +157,57 @@ def diffusion_loss(
         )
 
     batch_size = clean_motion.shape[0]
-    timesteps = torch.randint(
-        0,
-        schedule.timesteps,
-        (batch_size,),
-        device=clean_motion.device,
-        dtype=torch.long,
-    )
-    noise = torch.randn_like(clean_motion)
+    if timesteps is None:
+        timesteps = torch.randint(
+            0,
+            schedule.timesteps,
+            (batch_size,),
+            device=clean_motion.device,
+            dtype=torch.long,
+        )
+    elif timesteps.shape != (batch_size,):
+        raise ValueError(f"Expected timesteps shape ({batch_size},), got {tuple(timesteps.shape)}")
+    if noise is None:
+        noise = torch.randn_like(clean_motion)
+    elif tuple(noise.shape) != tuple(clean_motion.shape):
+        raise ValueError(f"Expected noise shape {tuple(clean_motion.shape)}, got {tuple(noise.shape)}")
     noisy_motion = schedule.q_sample(clean_motion, timesteps, noise)
-    predicted_noise = model(noisy_motion, conditioning, timesteps)
-    return torch.nn.functional.mse_loss(predicted_noise, noise)
+    if cond_drop_prob > 0.0:
+        keep = (
+            torch.rand((batch_size, 1, 1), device=conditioning.device)
+            >= cond_drop_prob
+        ).to(conditioning.dtype)
+        conditioning = conditioning * keep
+        if speaker is not None:
+            speaker = speaker * keep.reshape(batch_size, 1)
+    seed_motion = None
+    seed_mask = None
+    if getattr(model, "seed_conditioning", False) and seed_frames > 0:
+        seed_frames = min(seed_frames, clean_motion.shape[1])
+        seed_motion = torch.zeros_like(clean_motion)
+        seed_motion[:, :seed_frames] = clean_motion[:, :seed_frames]
+        seed_mask = torch.zeros(
+            (clean_motion.shape[0], clean_motion.shape[1], 1),
+            device=clean_motion.device,
+            dtype=clean_motion.dtype,
+        )
+        seed_mask[:, :seed_frames] = 1.0
+    prediction = model(
+        noisy_motion,
+        conditioning,
+        timesteps,
+        seed_motion=seed_motion,
+        seed_mask=seed_mask,
+        speaker=speaker,
+    )
+    target = clean_motion if schedule.prediction_type == "x0" else noise
+    squared_error = torch.square(prediction - target)
+    if valid_mask is None:
+        return squared_error.mean()
+    while valid_mask.ndim < squared_error.ndim:
+        valid_mask = valid_mask.unsqueeze(-1)
+    valid_mask = valid_mask.to(device=squared_error.device, dtype=squared_error.dtype)
+    return (squared_error * valid_mask).sum() / valid_mask.expand_as(squared_error).sum().clamp(min=1.0)
 
 
 def run_epoch(
@@ -153,16 +224,27 @@ def run_epoch(
     model.train(training)
     total_loss = 0.0
 
-    for batch_idx, (batch_x, batch_y) in enumerate(dataloader):
+    for batch_idx, (batch_x, batch_y, batch_speaker, batch_mask) in enumerate(dataloader):
         batch_x = batch_x.to(device, non_blocking=True)
         batch_y = batch_y.to(device, non_blocking=True)
+        batch_speaker = batch_speaker.to(device, non_blocking=True)
+        batch_mask = batch_mask.to(device, non_blocking=True)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
 
         with torch.set_grad_enabled(training):
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                loss = diffusion_loss(model, schedule, batch_x, batch_y)
+                loss = diffusion_loss(
+                    model,
+                    schedule,
+                    batch_x,
+                    batch_y,
+                    speaker=batch_speaker,
+                    valid_mask=batch_mask,
+                    seed_frames=getattr(model, "training_seed_frames", 0),
+                    cond_drop_prob=getattr(model, "cond_drop_prob", 0.0) if training else 0.0,
+                )
 
         if training:
             scaler.scale(loss).backward()
@@ -175,7 +257,7 @@ def run_epoch(
         if training and ((batch_idx + 1) == 1 or (batch_idx + 1) % log_every == 0):
             print(
                 f"  Epoch {epoch} | Batch {batch_idx + 1}/{len(dataloader)} "
-                f"| Noise MSE: {loss.item():.6f}",
+                f"| Diffusion loss: {loss.item():.6f}",
                 flush=True,
             )
 
@@ -210,18 +292,52 @@ def save_checkpoint(
 
 
 def sanity_check(model, schedule, dataloader, device, args):
-    print("[SANITY] Overfitting one batch with diffusion noise prediction", flush=True)
+    print(
+        f"[SANITY] Overfitting one batch with diffusion {schedule.prediction_type} prediction",
+        flush=True,
+    )
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-    batch_x, batch_y = next(iter(dataloader))
+    batch_x, batch_y, batch_speaker, batch_mask = next(iter(dataloader))
     batch_x = batch_x.to(device)
     batch_y = batch_y.to(device)
-    print(f"[SANITY] X={tuple(batch_x.shape)} Y={tuple(batch_y.shape)}", flush=True)
+    batch_speaker = batch_speaker.to(device)
+    batch_mask = batch_mask.to(device)
+    print(
+        f"[SANITY] X={tuple(batch_x.shape)} Y={tuple(batch_y.shape)} "
+        f"Speaker={tuple(batch_speaker.shape)}",
+        flush=True,
+    )
+    fixed_timesteps = torch.randint(
+        0,
+        schedule.timesteps,
+        (batch_y.shape[0],),
+        device=device,
+        dtype=torch.long,
+    )
+    fixed_noise = torch.randn_like(batch_y)
+    previous_training_mode = model.training
+    model.eval()
+    print(
+        "[SANITY] Using fixed diffusion noise/timesteps, cond_drop_prob=0, and dropout disabled",
+        flush=True,
+    )
 
     for step in range(args.sanity_steps):
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            loss = diffusion_loss(model, schedule, batch_x, batch_y)
+            loss = diffusion_loss(
+                model,
+                schedule,
+                batch_x,
+                batch_y,
+                speaker=batch_speaker,
+                valid_mask=batch_mask,
+                seed_frames=args.seed_frames,
+                cond_drop_prob=0.0,
+                timesteps=fixed_timesteps,
+                noise=fixed_noise,
+            )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -229,6 +345,7 @@ def sanity_check(model, schedule, dataloader, device, args):
         scaler.update()
         if step == 0 or (step + 1) % 25 == 0:
             print(f"[SANITY] {step + 1}/{args.sanity_steps}  Loss: {loss.item():.6f}")
+    model.train(previous_training_mode)
 
 
 def train(args):
@@ -246,6 +363,7 @@ def train(args):
         "timesteps": args.diffusion_steps,
         "beta_start": args.beta_start,
         "beta_end": args.beta_end,
+        "prediction_type": args.prediction_type,
     }
     print(
         f"[DATA] {len(train_dataset)} windows | input_dim={model_config['input_dim']} "
@@ -275,6 +393,8 @@ def train(args):
         print(f"[VAL] {len(val_dataset)} validation windows", flush=True)
 
     model = ConditionalMotionDenoiser(**model_config).to(device)
+    model.training_seed_frames = args.seed_frames
+    model.cond_drop_prob = args.cond_drop_prob
     schedule = DiffusionSchedule(**diffusion_config).to(device)
 
     if args.sanity_check:
@@ -385,11 +505,19 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--num-layers", type=int, default=6)
+    parser.add_argument("--conditioning-layers", type=int, default=2,
+                        help="Number of Transformer layers in the audio/text conditioning encoder")
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max-frames", type=int, default=512)
     parser.add_argument("--diffusion-steps", type=int, default=1000)
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=0.02)
+    parser.add_argument("--prediction-type", choices=["x0", "epsilon"], default="epsilon",
+                        help="Train the denoiser to predict clean motion x0 or diffusion noise")
+    parser.add_argument("--cond-drop-prob", type=float, default=0.1,
+                        help="Probability of dropping conditioning during training for classifier-free guidance")
+    parser.add_argument("--seed-frames", type=int, default=15,
+                        help="Number of leading ground-truth frames used as seed gesture conditioning")
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true", help="Force CPU training")
