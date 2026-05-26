@@ -117,6 +117,10 @@ def validate_args_and_data(args, dataset: PreprocessedGestureDataset, label: str
         raise ValueError("--weight-decay cannot be negative")
     if not 0.0 <= args.cond_drop_prob < 1.0:
         raise ValueError("--cond-drop-prob must be in [0, 1)")
+    if args.velocity_loss_weight < 0:
+        raise ValueError("--velocity-loss-weight cannot be negative")
+    if args.acceleration_loss_weight < 0:
+        raise ValueError("--acceleration-loss-weight cannot be negative")
     if args.seed_frames < 0:
         raise ValueError("--seed-frames cannot be negative")
     window_frames = dataset_window_frames(dataset)
@@ -132,6 +136,90 @@ def validate_args_and_data(args, dataset: PreprocessedGestureDataset, label: str
         )
 
 
+def masked_mse(values: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
+    squared_error = torch.square(values - target)
+    if valid_mask is None:
+        return squared_error.mean()
+    while valid_mask.ndim < squared_error.ndim:
+        valid_mask = valid_mask.unsqueeze(-1)
+    valid_mask = valid_mask.to(device=squared_error.device, dtype=squared_error.dtype)
+    return (squared_error * valid_mask).sum() / valid_mask.expand_as(squared_error).sum().clamp(min=1.0)
+
+
+def weighted_mse(
+    values: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    weights: torch.Tensor | None,
+) -> torch.Tensor:
+    """MSE where weights reduce contribution without being normalized away."""
+    squared_error = torch.square(values - target)
+    if valid_mask is None:
+        valid_mask = torch.ones_like(squared_error[..., :1])
+    while valid_mask.ndim < squared_error.ndim:
+        valid_mask = valid_mask.unsqueeze(-1)
+    valid_mask = valid_mask.to(device=squared_error.device, dtype=squared_error.dtype)
+    if weights is None:
+        weights = torch.ones_like(valid_mask)
+    while weights.ndim < squared_error.ndim:
+        weights = weights.unsqueeze(-1)
+    weights = weights.to(device=squared_error.device, dtype=squared_error.dtype)
+    numerator = (squared_error * valid_mask * weights).sum()
+    denominator = valid_mask.expand_as(squared_error).sum().clamp(min=1.0)
+    return numerator / denominator
+
+
+def reconstruct_x0(
+    schedule: DiffusionSchedule,
+    noisy_motion: torch.Tensor,
+    model_prediction: torch.Tensor,
+    timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Convert an x0/epsilon model output into a clean-motion estimate."""
+    if schedule.prediction_type == "x0":
+        return model_prediction
+    sqrt_alpha = schedule._extract(schedule.sqrt_alpha_cumprod, timesteps, noisy_motion.shape)
+    sqrt_one_minus = schedule._extract(
+        schedule.sqrt_one_minus_alpha_cumprod, timesteps, noisy_motion.shape
+    )
+    return (noisy_motion - sqrt_one_minus * model_prediction) / sqrt_alpha.clamp(min=1e-8)
+
+
+def motion_smoothness_loss(
+    predicted_x0: torch.Tensor,
+    clean_motion: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    timestep_weight: torch.Tensor | None,
+    velocity_weight: float,
+    acceleration_weight: float,
+) -> torch.Tensor:
+    """Penalize jitter in the predicted clean motion with finite differences."""
+    loss = predicted_x0.new_zeros(())
+    if velocity_weight > 0 and predicted_x0.shape[1] > 1:
+        pred_vel = predicted_x0[:, 1:] - predicted_x0[:, :-1]
+        true_vel = clean_motion[:, 1:] - clean_motion[:, :-1]
+        vel_mask = None
+        if valid_mask is not None:
+            vel_mask = valid_mask[:, 1:] * valid_mask[:, :-1]
+        vel_weight = timestep_weight
+        if vel_weight is not None:
+            vel_weight = vel_weight[:, 1:] * vel_weight[:, :-1]
+        loss = loss + velocity_weight * weighted_mse(pred_vel, true_vel, vel_mask, vel_weight)
+    if acceleration_weight > 0 and predicted_x0.shape[1] > 2:
+        pred_vel = predicted_x0[:, 1:] - predicted_x0[:, :-1]
+        true_vel = clean_motion[:, 1:] - clean_motion[:, :-1]
+        pred_acc = pred_vel[:, 1:] - pred_vel[:, :-1]
+        true_acc = true_vel[:, 1:] - true_vel[:, :-1]
+        acc_mask = None
+        if valid_mask is not None:
+            acc_mask = valid_mask[:, 2:] * valid_mask[:, 1:-1] * valid_mask[:, :-2]
+        acc_weight = timestep_weight
+        if acc_weight is not None:
+            acc_weight = acc_weight[:, 2:] * acc_weight[:, 1:-1] * acc_weight[:, :-2]
+        loss = loss + acceleration_weight * weighted_mse(pred_acc, true_acc, acc_mask, acc_weight)
+    return loss
+
+
 def diffusion_loss(
     model: nn.Module,
     schedule: DiffusionSchedule,
@@ -143,6 +231,8 @@ def diffusion_loss(
     cond_drop_prob: float = 0.0,
     timesteps: torch.Tensor | None = None,
     noise: torch.Tensor | None = None,
+    velocity_loss_weight: float = 0.0,
+    acceleration_loss_weight: float = 0.0,
 ) -> torch.Tensor:
     if conditioning.ndim != 3:
         raise ValueError(f"Expected conditioning shape (B, T, C), got {tuple(conditioning.shape)}")
@@ -201,13 +291,25 @@ def diffusion_loss(
         speaker=speaker,
     )
     target = clean_motion if schedule.prediction_type == "x0" else noise
-    squared_error = torch.square(prediction - target)
-    if valid_mask is None:
-        return squared_error.mean()
-    while valid_mask.ndim < squared_error.ndim:
-        valid_mask = valid_mask.unsqueeze(-1)
-    valid_mask = valid_mask.to(device=squared_error.device, dtype=squared_error.dtype)
-    return (squared_error * valid_mask).sum() / valid_mask.expand_as(squared_error).sum().clamp(min=1.0)
+    loss = masked_mse(prediction, target, valid_mask)
+    if velocity_loss_weight > 0 or acceleration_loss_weight > 0:
+        predicted_x0 = reconstruct_x0(schedule, noisy_motion, prediction, timesteps)
+        timestep_weight = None
+        if schedule.prediction_type == "epsilon":
+            # x0 estimates are unreliable at high-noise timesteps early in training.
+            # Down-weight the auxiliary motion loss when little signal remains.
+            timestep_weight = schedule._extract(
+                schedule.alpha_cumprod, timesteps, clean_motion.shape
+            ).detach().expand(clean_motion.shape[0], clean_motion.shape[1], 1)
+        loss = loss + motion_smoothness_loss(
+            predicted_x0,
+            clean_motion,
+            valid_mask,
+            timestep_weight,
+            velocity_loss_weight,
+            acceleration_loss_weight,
+        )
+    return loss
 
 
 def run_epoch(
@@ -244,6 +346,8 @@ def run_epoch(
                     valid_mask=batch_mask,
                     seed_frames=getattr(model, "training_seed_frames", 0),
                     cond_drop_prob=getattr(model, "cond_drop_prob", 0.0) if training else 0.0,
+                    velocity_loss_weight=getattr(model, "velocity_loss_weight", 0.0),
+                    acceleration_loss_weight=getattr(model, "acceleration_loss_weight", 0.0),
                 )
 
         if training:
@@ -395,6 +499,8 @@ def train(args):
     model = ConditionalMotionDenoiser(**model_config).to(device)
     model.training_seed_frames = args.seed_frames
     model.cond_drop_prob = args.cond_drop_prob
+    model.velocity_loss_weight = args.velocity_loss_weight
+    model.acceleration_loss_weight = args.acceleration_loss_weight
     schedule = DiffusionSchedule(**diffusion_config).to(device)
 
     if args.sanity_check:
@@ -516,6 +622,10 @@ def main():
                         help="Train the denoiser to predict clean motion x0 or diffusion noise")
     parser.add_argument("--cond-drop-prob", type=float, default=0.1,
                         help="Probability of dropping conditioning during training for classifier-free guidance")
+    parser.add_argument("--velocity-loss-weight", type=float, default=0.005,
+                        help="Auxiliary clean-motion velocity loss weight to reduce frame-to-frame jitter")
+    parser.add_argument("--acceleration-loss-weight", type=float, default=0.001,
+                        help="Auxiliary clean-motion acceleration loss weight to reduce twitchy motion")
     parser.add_argument("--seed-frames", type=int, default=15,
                         help="Number of leading ground-truth frames used as seed gesture conditioning")
     parser.add_argument("--log-every", type=int, default=25)

@@ -112,7 +112,9 @@ def load_words_from_textgrid(textgrid_path: Path | None) -> list[dict]:
 
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device):
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # Load on CPU first to avoid allocating checkpoint storage on a busy GPU
+    # before the model has been constructed.
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         return checkpoint
     return {"model_state_dict": checkpoint, "model_config": {}}

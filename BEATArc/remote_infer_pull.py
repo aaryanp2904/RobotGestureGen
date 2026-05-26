@@ -26,7 +26,7 @@ DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
 DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
 DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
 DEFAULT_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Checkpoints/gesture_transformer_best.pth"
-DEFAULT_DIFFUSION_CHECKPOINT = "/vol/bitbucket/ap1922/BEAT2_NAO_Diffusion_Checkpoints/diffusion_best.pth"
+DEFAULT_DIFFUSION_CHECKPOINT = "/vol/bitbucket/ap1922/diffusion_checkpoints/diffusion_best.pth"
 DEFAULT_STATS = "/vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed/normalization_stats.json"
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
@@ -91,22 +91,21 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         f"--clip-id {remote_quote(args.clip_id)} "
         f"--audio-dir {remote_quote(audio_dir)} "
         f"--textgrid-dir {remote_quote(textgrid_dir)} "
+        f"--fps {remote_quote(str(args.fps))} "
         f"--window-size {remote_quote(str(args.window_size))} "
         f"--stride {remote_quote(str(args.stride))} "
         f"--output {remote_quote(remote_output)}"
     )
     if args.model_type != "auto":
         command += f" --model-type {remote_quote(args.model_type)}"
+    if args.speaker_id is not None:
+        command += f" --speaker-id {remote_quote(args.speaker_id)}"
     if args.seed is not None:
         command += f" --seed {remote_quote(str(args.seed))}"
     if args.diffusion_deterministic:
         command += " --diffusion-deterministic"
-    if args.sampler != "ddpm":
-        command += f" --sampler {remote_quote(args.sampler)}"
-    if args.sample_steps != 50:
-        command += f" --sample-steps {remote_quote(str(args.sample_steps))}"
-    if args.guidance_scale != 1.0:
-        command += f" --guidance-scale {remote_quote(str(args.guidance_scale))}"
+    if args.diffusion_seed_frames is not None:
+        command += f" --diffusion-seed-frames {remote_quote(str(args.diffusion_seed_frames))}"
     if args.smooth_window != 1:
         command += f" --smooth-window {remote_quote(str(args.smooth_window))}"
     if args.velocity_limit:
@@ -216,6 +215,8 @@ def main():
     parser.add_argument("--model-type", choices=["auto", "transformer", "diffusion"],
                         default="auto",
                         help="Remote inference model family. Use diffusion for diffusion checkpoints")
+    parser.add_argument("--fps", type=int, default=30,
+                        help="Remote inference frame rate")
     parser.add_argument("--window-size", type=float, default=2.0,
                         help="Inference window size in seconds")
     parser.add_argument("--stride", type=float, default=0.5,
@@ -224,12 +225,10 @@ def main():
                         help="Optional random seed for remote diffusion sampling")
     parser.add_argument("--diffusion-deterministic", action="store_true",
                         help="Use posterior means during remote diffusion sampling")
-    parser.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddpm",
-                        help="Remote diffusion sampler")
-    parser.add_argument("--sample-steps", type=int, default=50,
-                        help="Number of DDIM sample steps for remote diffusion inference")
-    parser.add_argument("--guidance-scale", type=float, default=1.0,
-                        help="Classifier-free guidance scale for remote diffusion inference")
+    parser.add_argument("--diffusion-seed-frames", type=int, default=None,
+                        help="Leading generated frames reused as seed context for each diffusion window")
+    parser.add_argument("--speaker-id", default=None,
+                        help="Speaker id for diffusion speaker conditioning; defaults to clip id prefix remotely")
     parser.add_argument("--smooth-window", type=int, default=1,
                         help="Remote output moving-average smoothing window in frames")
     parser.add_argument("--velocity-limit", action="store_true",
@@ -264,10 +263,18 @@ def main():
     args = parser.parse_args()
     if args.model_type == "diffusion" and args.checkpoint == DEFAULT_CHECKPOINT:
         args.checkpoint = args.diffusion_checkpoint
-    if args.sample_steps <= 0:
-        raise ValueError("--sample-steps must be positive")
-    if args.guidance_scale < 0:
-        raise ValueError("--guidance-scale cannot be negative")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
+    if args.window_size <= 0:
+        raise ValueError("--window-size must be positive")
+    if args.stride <= 0:
+        raise ValueError("--stride must be positive")
+    if args.diffusion_seed_frames is not None and args.diffusion_seed_frames < 0:
+        raise ValueError("--diffusion-seed-frames cannot be negative")
+    if args.smooth_window < 1:
+        raise ValueError("--smooth-window must be at least 1")
+    if args.velocity_scale <= 0:
+        raise ValueError("--velocity-scale must be positive")
     ensure_ssh_control_dir(args)
 
     local_dir = Path(args.local_dir)

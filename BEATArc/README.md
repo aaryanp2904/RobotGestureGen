@@ -60,7 +60,9 @@ your dataset layout differs.
 
 ## Remote Inference
 
-Run inference on `oak11.doc.ic.ac.uk` from your local machine and pull outputs:
+Run inference on `oak21.doc.ic.ac.uk` from your local machine and pull outputs.
+All DOC machine access goes through `shell1.doc.ic.ac.uk`, which is the default
+jump host used by this helper:
 
 ```bash
 python BEATArc/remote_infer_pull.py 10_kieks_0_103_103
