@@ -234,11 +234,35 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
     prosody = (prosody - prosody_mean) / prosody_std
 
     expected_input_dim = int(model_config.get("input_dim", prosody.shape[1]))
-    wavlm_dim = int(dataset_metadata.get("wavlm_dim", stats.get("wavlm_dim", 0)) or 0)
-    text_dim = dataset_metadata.get("text_dim")
-    if text_dim is None:
+    metadata_has_wavlm = dataset_metadata.get("wavlm_dim") is not None
+    metadata_has_text = dataset_metadata.get("text_dim") is not None
+    wavlm_dim = int(dataset_metadata.get("wavlm_dim", 0) or 0)
+    text_dim = int(dataset_metadata.get("text_dim", 0) or 0)
+    remaining_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES)
+    if not metadata_has_wavlm and not metadata_has_text:
+        # Older checkpoints may be paired with newer stats files. In that case
+        # trust the checkpoint input size instead of blindly using stats wavlm_dim.
+        if remaining_dim == 0:
+            wavlm_dim = 0
+            text_dim = 0
+        elif remaining_dim == TEXT_EMBED_DIM:
+            wavlm_dim = 0
+            text_dim = TEXT_EMBED_DIM
+        elif int(stats.get("wavlm_dim", 0) or 0) == remaining_dim:
+            wavlm_dim = remaining_dim
+            text_dim = 0
+        elif remaining_dim > TEXT_EMBED_DIM and int(stats.get("wavlm_dim", 0) or 0) == remaining_dim - TEXT_EMBED_DIM:
+            wavlm_dim = remaining_dim - TEXT_EMBED_DIM
+            text_dim = TEXT_EMBED_DIM
+        else:
+            raise ValueError(
+                f"Cannot infer feature layout for checkpoint input_dim={expected_input_dim}. "
+                "Use a checkpoint with dataset_metadata or matching preprocessing stats."
+            )
+    elif not metadata_has_wavlm:
+        wavlm_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - text_dim
+    elif not metadata_has_text:
         text_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - wavlm_dim
-    text_dim = int(text_dim)
     if wavlm_dim < 0 or text_dim < 0:
         raise ValueError(
             f"Checkpoint input_dim {expected_input_dim} is inconsistent with "
