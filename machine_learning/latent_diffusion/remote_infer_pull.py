@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_REMOTE = "ap1922@oak21.doc.ic.ac.uk"
+DEFAULT_REMOTE = "ap1922@gpu32.doc.ic.ac.uk"
 DEFAULT_JUMP_HOST = "shell1.doc.ic.ac.uk"
 DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
 DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
