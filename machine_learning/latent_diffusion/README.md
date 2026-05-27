@@ -72,16 +72,23 @@ python -m machine_learning.latent_diffusion.train_autoencoder \
 
 Build latent LMDBs:
 
+The latent LMDB stores only latent motion plus a `source_idx` back to the
+preprocessed LMDB. Keep `$PRE/train.lmdb` and `$PRE/val.lmdb` available during
+latent diffusion training; this avoids duplicating the large `x` conditioning
+windows in every latent record.
+
 ```bash
 python -m machine_learning.latent_diffusion.build_latent_dataset \
   --data-dir "$PRE/train.lmdb" \
   --autoencoder "$AE/autoencoder_best.pth" \
-  --output-dir "$LAT/train_latent.lmdb"
+  --output-dir "$LAT/train_latent.lmdb" \
+  --overwrite
 
 python -m machine_learning.latent_diffusion.build_latent_dataset \
   --data-dir "$PRE/val.lmdb" \
   --autoencoder "$AE/autoencoder_best.pth" \
-  --output-dir "$LAT/val_latent.lmdb"
+  --output-dir "$LAT/val_latent.lmdb" \
+  --overwrite
 ```
 
 Train latent diffusion:
@@ -97,6 +104,54 @@ python -m machine_learning.latent_diffusion.train_diffusion \
   --diffusion-steps 100 \
   --latent-dim 32
 ```
+
+If LMDB training from `/vol/bitbucket` is too slow, convert the compact latent
+LMDBs to sequential fp16 shards and cache one shard at a time in `/tmp`. These
+shards still store only latents plus source indices, not duplicated
+conditioning:
+
+```bash
+SHARDS=/vol/bitbucket/ap1922/BEAT2_NAO_Latents_Smooth_Shards
+SHARD_CACHE=/tmp/ap1922/latent_shard_cache
+
+python -m machine_learning.latent_diffusion.build_latent_shards \
+  --data-dir "$LAT/train_latent.lmdb" \
+  --output-dir "$SHARDS/train" \
+  --dtype float16 \
+  --shard-size 512 \
+  --overwrite
+
+python -m machine_learning.latent_diffusion.build_latent_shards \
+  --data-dir "$LAT/val_latent.lmdb" \
+  --output-dir "$SHARDS/val" \
+  --dtype float16 \
+  --shard-size 512 \
+  --overwrite
+```
+
+Then train from the sharded dataset:
+
+```bash
+python -m machine_learning.latent_diffusion.train_diffusion \
+  --data-dir "$SHARDS/train" \
+  --val-data-dir "$SHARDS/val" \
+  --cache-dir "$SHARD_CACHE" \
+  --no-shuffle \
+  --num-workers 0 \
+  --autoencoder "$AE/autoencoder_best.pth" \
+  --output-dir "$LD" \
+  --epochs 100 \
+  --batch-size 64 \
+  --diffusion-steps 100 \
+  --latent-dim 32 \
+  --log-every 5
+```
+
+If you move the compact latent dataset or preprocessed LMDBs after building,
+pass `--source-data-dir "$PRE/train.lmdb"` and
+`--val-source-data-dir "$PRE/val.lmdb"` to `train_diffusion`. The same
+`--source-data-dir` override is available on `build_latent_shards` if you need
+to shard a moved compact latent LMDB.
 
 Run local inference:
 

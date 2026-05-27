@@ -16,6 +16,21 @@ from .dataset import PreprocessedGestureDataset
 from .model import MotionAutoencoder
 
 
+def estimate_map_size(num_samples: int, metadata: dict, latent_dim: int, store_conditioning: bool) -> int:
+    """Pick an LMDB map size with headroom without reserving tens of GB."""
+    window_frames = int(metadata.get("window_frames", 0) or 0)
+    input_dim = int(metadata.get("input_dim", 0) or 0)
+    speaker_dim = int(metadata.get("speaker_dim", 0) or 0)
+    latent_bytes = max(window_frames, 1) * int(latent_dim) * np.dtype(np.float32).itemsize
+    record_bytes = latent_bytes + 256
+    if store_conditioning:
+        record_bytes += max(window_frames, 1) * input_dim * np.dtype(np.float32).itemsize
+        record_bytes += max(window_frames, 1) * np.dtype(np.float32).itemsize
+        record_bytes += speaker_dim * np.dtype(np.float32).itemsize
+    estimated = int(num_samples * record_bytes * 2.0) + 64 * 1024**2
+    return max(estimated, 256 * 1024**2)
+
+
 def load_autoencoder(checkpoint_path: Path, device: torch.device) -> tuple[MotionAutoencoder, dict, dict]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint.get("autoencoder_config")
@@ -59,15 +74,19 @@ def write_latent_lmdb(args):
     metadata = dict(source.metadata)
     metadata.update(
         {
+            "format": "latent_lmdb_v2",
+            "compact": not bool(args.store_conditioning),
             "target_shape": [int(ae_config["latent_dim"])],
             "target_type": "latent_motion",
             "target_mode": "latent",
             "target_representation": "gesture_latent",
             "latent_dim": int(ae_config["latent_dim"]),
+            "source_data_dir": str(Path(args.data_dir).resolve()),
             "source_target_shape": list(source_shape),
             "source_target_mode": source.metadata.get("target_mode", "angle"),
             "source_target_type": source.metadata.get("target_type"),
             "source_target_representation": source.metadata.get("target_representation"),
+            "stores_conditioning": bool(args.store_conditioning),
             "autoencoder_config": {
                 **ae_config,
                 "target_shape": list(ae_config["target_shape"]),
@@ -84,9 +103,21 @@ def write_latent_lmdb(args):
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available() and not args.cpu,
     )
-    env = lmdb.open(str(output_dir), map_size=args.map_size, subdir=True, lock=True)
+    map_size = args.map_size
+    if map_size is None:
+        map_size = estimate_map_size(
+            len(source),
+            source.metadata,
+            int(ae_config["latent_dim"]),
+            bool(args.store_conditioning),
+        )
+    env = lmdb.open(str(output_dir), map_size=map_size, subdir=True, lock=True)
     index = 0
-    print(f"[LATENTS] Encoding {len(source)} windows to {output_dir} on {device}", flush=True)
+    print(
+        f"[LATENTS] Encoding {len(source)} windows to {output_dir} on {device} "
+        f"(map_size={map_size / 1024**3:.2f} GiB)",
+        flush=True,
+    )
     try:
         with env.begin(write=True) as txn:
             txn.put(b"__len__", pickle.dumps(len(source)))
@@ -96,16 +127,23 @@ def write_latent_lmdb(args):
             for batch_idx, (x, motion, speaker, valid_mask) in enumerate(loader):
                 motion = motion.to(device, non_blocking=True)
                 latents = model.encode(motion).cpu().numpy().astype(np.float32)
-                x_np = x.numpy().astype(np.float32)
-                speaker_np = speaker.numpy().astype(np.float32)
-                mask_np = valid_mask.numpy().astype(np.float32)
+                if args.store_conditioning:
+                    x_np = x.numpy().astype(np.float32)
+                    speaker_np = speaker.numpy().astype(np.float32)
+                    mask_np = valid_mask.numpy().astype(np.float32)
                 for item_idx in range(latents.shape[0]):
                     record = {
-                        "x": x_np[item_idx],
                         "y": latents[item_idx],
-                        "speaker": speaker_np[item_idx],
-                        "valid_mask": mask_np[item_idx],
+                        "source_idx": index,
                     }
+                    if args.store_conditioning:
+                        record.update(
+                            {
+                                "x": x_np[item_idx],
+                                "speaker": speaker_np[item_idx],
+                                "valid_mask": mask_np[item_idx],
+                            }
+                        )
                     txn.put(f"{index:08d}".encode(), pickle.dumps(record, protocol=pickle.HIGHEST_PROTOCOL))
                     index += 1
                     if index % args.commit_every == 0:
@@ -130,10 +168,13 @@ def main():
     parser.add_argument("--output-dir", required=True, help="Output latent .lmdb directory")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--map-size", type=int, default=64 * 1024**3)
+    parser.add_argument("--map-size", type=int, default=None,
+                        help="Optional LMDB map size in bytes; defaults to a compact estimate")
     parser.add_argument("--commit-every", type=int, default=2048,
                         help="Commit the LMDB write transaction every N records")
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--store-conditioning", action="store_true",
+                        help="Compatibility mode: duplicate x/speaker/mask into the latent LMDB")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()

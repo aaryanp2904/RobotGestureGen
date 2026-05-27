@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from machine_learning.diffusion.train import diffusion_loss
 
-from .dataset import LatentGestureDataset
+from .dataset import make_latent_dataset
 from .model import DiffusionSchedule, LatentDenoiser
 
 
@@ -70,7 +70,7 @@ def make_loader(dataset, args, shuffle: bool) -> DataLoader:
     )
 
 
-def validate_dataset(dataset: LatentGestureDataset, args, label: str):
+def validate_dataset(dataset, args, label: str):
     if len(dataset) == 0:
         raise ValueError(f"No {label} latent windows found in {dataset.data_dir}")
     window_frames = int(dataset.metadata.get("window_frames", dataset[0][0].shape[0]))
@@ -174,7 +174,11 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print(f"[TRAIN-LD] Device: {device}", flush=True)
 
-    train_dataset = LatentGestureDataset(args.data_dir)
+    train_dataset = make_latent_dataset(
+        args.data_dir,
+        cache_dir=args.cache_dir,
+        source_data_dir=args.source_data_dir,
+    )
     validate_dataset(train_dataset, args, "training")
     model_config = make_config(train_dataset.metadata, args)
     diffusion_config = {
@@ -189,7 +193,7 @@ def train(args):
     if autoencoder_state is None:
         raise ValueError("Pass --autoencoder so inference checkpoints include the decoder weights")
 
-    train_loader = make_loader(train_dataset, args, shuffle=True)
+    train_loader = make_loader(train_dataset, args, shuffle=not args.no_shuffle)
     val_loader = None
     val_data_dir = args.val_data_dir
     if val_data_dir is None:
@@ -198,7 +202,11 @@ def train(args):
             val_data_dir = str(candidate)
             print(f"[VAL] Auto-detected validation latent LMDB: {val_data_dir}", flush=True)
     if val_data_dir:
-        val_dataset = LatentGestureDataset(val_data_dir)
+        val_dataset = make_latent_dataset(
+            val_data_dir,
+            cache_dir=args.cache_dir,
+            source_data_dir=args.val_source_data_dir,
+        )
         validate_dataset(val_dataset, args, "validation")
         if metadata_contract(val_dataset.metadata) != metadata_contract(train_dataset.metadata):
             raise ValueError("Validation latent metadata does not match training latent metadata")
@@ -297,6 +305,14 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--cache-dir", default=None,
+                        help="Optional local cache for one sharded dataset file at a time")
+    parser.add_argument("--source-data-dir", default=None,
+                        help="Override source preprocessed LMDB for compact training latents")
+    parser.add_argument("--val-source-data-dir", default=None,
+                        help="Override source preprocessed LMDB for compact validation latents")
+    parser.add_argument("--no-shuffle", action="store_true",
+                        help="Read training samples sequentially; recommended for sharded datasets on slow storage")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--latent-dim", type=int, default=32)
