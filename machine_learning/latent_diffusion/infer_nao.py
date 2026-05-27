@@ -55,7 +55,12 @@ LATENT_DENOISER_KEYS = {
 
 
 def latent_model_kwargs(model_config: dict) -> dict:
-    return {key: value for key, value in model_config.items() if key in LATENT_DENOISER_KEYS}
+    kwargs = {key: value for key, value in model_config.items() if key in LATENT_DENOISER_KEYS}
+    if "target_shape" in kwargs:
+        kwargs["target_shape"] = tuple(kwargs["target_shape"])
+    if "latent_dim" in kwargs:
+        kwargs["latent_dim"] = int(kwargs["latent_dim"])
+    return kwargs
 
 
 def load_checkpoint(path: Path) -> dict:
@@ -72,6 +77,16 @@ def validate_latent_contract(model_config: dict, autoencoder_config: dict, stats
         raise ValueError("Checkpoint model_config is missing input_dim")
     if int(model_config.get("latent_dim", 0)) <= 0:
         raise ValueError("Checkpoint model_config is missing latent_dim")
+    if tuple(model_config.get("target_shape", ())) != (int(model_config["latent_dim"]),):
+        raise ValueError(
+            f"Checkpoint latent target_shape {model_config.get('target_shape')} does not match "
+            f"latent_dim={model_config['latent_dim']}"
+        )
+    if int(autoencoder_config.get("latent_dim", 0)) != int(model_config["latent_dim"]):
+        raise ValueError(
+            f"Autoencoder latent_dim={autoencoder_config.get('latent_dim')} does not match "
+            f"denoiser latent_dim={model_config['latent_dim']}"
+        )
     if metadata.get("target_representation") != "gesture_latent":
         raise ValueError("Checkpoint dataset_metadata must describe gesture_latent targets")
     source_representation = (
@@ -90,6 +105,11 @@ def validate_latent_contract(model_config: dict, autoencoder_config: dict, stats
     for key in ("prosody_mean", "prosody_std", "nao_mean", "nao_std"):
         if key not in stats:
             raise ValueError(f"Stats file is missing required key: {key}")
+    wavlm_dim = int(metadata.get("wavlm_dim", stats.get("wavlm_dim", 0)) or 0)
+    if wavlm_dim > 0:
+        for key in ("wavlm_mean", "wavlm_std"):
+            if key not in stats:
+                raise ValueError(f"Stats file is missing required key for WavLM inference: {key}")
     stats_joint_names = stats.get("nao_joint_names")
     if stats_joint_names is not None and list(stats_joint_names) != list(NAO_JOINTS):
         raise ValueError("Stats NAO joint order does not match inference order")

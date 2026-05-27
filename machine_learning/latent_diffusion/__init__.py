@@ -1,19 +1,8 @@
-"""Latent diffusion training and inference for gesture windows."""
+"""Latent diffusion training and inference for gesture windows.
 
-from .dataset import (
-    LatentGestureDataset,
-    PreprocessedGestureDataset,
-    ShardedLatentGestureDataset,
-    make_latent_dataset,
-)
-from .model import DiffusionSchedule, LatentDenoiser, MotionAutoencoder
+The package keeps imports lightweight so ``remote_infer_pull`` can run on a
+local machine that only has SSH/SCP available. Import concrete classes from
+``machine_learning.latent_diffusion.model`` or ``.dataset`` when needed.
+"""
 
-__all__ = [
-    "DiffusionSchedule",
-    "LatentDenoiser",
-    "LatentGestureDataset",
-    "MotionAutoencoder",
-    "PreprocessedGestureDataset",
-    "ShardedLatentGestureDataset",
-    "make_latent_dataset",
-]
+__all__: list[str] = []
