@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -15,8 +16,8 @@ DEFAULT_JUMP_HOST = "shell1.doc.ic.ac.uk"
 DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
 DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
 DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
-DEFAULT_CHECKPOINT = "/vol/bitbucket/ap1922/latent_diffusion_checkpoints_smooth/latent_diffusion_best.pth"
-DEFAULT_STATS = "/vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed_Smooth/normalization_stats.json"
+DEFAULT_CHECKPOINT = "/data/ap1922/latent_diffusion_checkpoints_new/latent_diffusion_best.pth"
+DEFAULT_STATS = "/data/ap1922/Preprocessed_BEAT2_New/normalization_stats.json"
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -34,7 +35,7 @@ def remote_quote(value: str) -> str:
 
 
 def ssh_reuse_options(args) -> list[str]:
-    if args.no_ssh_reuse:
+    if args.no_ssh_reuse or os.name == "nt":
         return []
     return [
         "-o",
@@ -97,6 +98,10 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         command += " --velocity-limit"
     if args.velocity_scale != 1.0:
         command += f" --velocity-scale {remote_quote(str(args.velocity_scale))}"
+    if args.disable_energy_gate:
+        command += " --disable-energy-gate"
+    if args.rest_blend != 0.5:
+        command += f" --rest-blend {remote_quote(str(args.rest_blend))}"
     if args.text_cpu:
         command += " --text-cpu"
     if args.wavlm_cpu:
@@ -160,6 +165,10 @@ def main():
     parser.add_argument("--smooth-window", type=int, default=1)
     parser.add_argument("--velocity-limit", action="store_true")
     parser.add_argument("--velocity-scale", type=float, default=1.0)
+    parser.add_argument("--disable-energy-gate", action="store_true",
+                        help="Disable latent low-energy rest blending remotely")
+    parser.add_argument("--rest-blend", type=float, default=0.5,
+                        help="Remote low-energy rest blend strength")
     parser.add_argument("--local-dir", default="nao_predictions")
     parser.add_argument("--remote-python", default="python")
     parser.add_argument("--remote-setup", default="")
@@ -188,6 +197,8 @@ def main():
         raise ValueError("--smooth-window must be at least 1")
     if args.velocity_scale <= 0:
         raise ValueError("--velocity-scale must be positive")
+    if not 0.0 <= args.rest_blend <= 1.0:
+        raise ValueError("--rest-blend must be in [0, 1]")
 
     ensure_ssh_control_dir(args)
     local_dir = Path(args.local_dir)

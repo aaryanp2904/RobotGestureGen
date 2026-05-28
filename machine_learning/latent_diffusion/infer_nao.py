@@ -18,6 +18,7 @@ from BEATArc.infer_nao import (  # noqa: E402
     build_features,
     build_speaker_condition,
     clamp_nao_angles,
+    infer_energy_features_from_prosody,
     limit_nao_velocity,
     load_words_from_textgrid,
     overlap_weights,
@@ -31,6 +32,7 @@ from BEATArc.infer_nao import (  # noqa: E402
 )
 from BEATArc.config import AUDIO_DIR, MOCAP_FPS, TEXTGRID_DIR  # noqa: E402
 from BEATArc.nao_constants import NAO_JOINTS  # noqa: E402
+from BEATArc.preprocess_nao import PROSODY_FEATURE_NAMES  # noqa: E402
 
 from .model import DiffusionSchedule, LatentDenoiser, MotionAutoencoder  # noqa: E402
 
@@ -110,10 +112,37 @@ def validate_latent_contract(model_config: dict, autoencoder_config: dict, stats
         for key in ("wavlm_mean", "wavlm_std"):
             if key not in stats:
                 raise ValueError(f"Stats file is missing required key for WavLM inference: {key}")
+    if int(metadata.get("gesture_energy_dim", 0) or 0) > 0 and "gesture_energy_audio_thresholds" not in stats:
+        raise ValueError("Stats file is missing gesture_energy_audio_thresholds")
     stats_joint_names = stats.get("nao_joint_names")
     if stats_joint_names is not None and list(stats_joint_names) != list(NAO_JOINTS):
         raise ValueError("Stats NAO joint order does not match inference order")
     return metadata.get("source_target_mode") or stats.get("target_mode") or "angle"
+
+
+def energy_labels_for_features(features: np.ndarray, metadata: dict, stats: dict) -> np.ndarray | None:
+    dim = int(metadata.get("gesture_energy_dim", 0) or 0)
+    if dim <= 0:
+        return None
+    prosody = features[:, :len(PROSODY_FEATURE_NAMES)]
+    _energy_features, labels = infer_energy_features_from_prosody(prosody, stats, metadata)
+    return labels
+
+
+def apply_energy_rest_gate(
+    pred_norm: np.ndarray,
+    energy_labels: np.ndarray | None,
+    enabled: bool,
+    rest_blend: float,
+) -> np.ndarray:
+    if not enabled or energy_labels is None or rest_blend <= 0.0:
+        return pred_norm
+    if len(energy_labels) != len(pred_norm):
+        raise ValueError("Energy labels length does not match prediction length")
+    out = pred_norm.copy()
+    low_mask = energy_labels == 0
+    out[low_mask] = (1.0 - rest_blend) * out[low_mask]
+    return out.astype(np.float32)
 
 
 @torch.no_grad()
@@ -236,6 +265,12 @@ def main():
     parser.add_argument("--smooth-window", type=int, default=1)
     parser.add_argument("--velocity-limit", action="store_true")
     parser.add_argument("--velocity-scale", type=float, default=1.0)
+    parser.add_argument("--energy-gate", dest="energy_gate", action="store_true", default=True,
+                        help="Blend low-energy regions toward the normalized rest pose (default)")
+    parser.add_argument("--disable-energy-gate", dest="energy_gate", action="store_false",
+                        help="Disable low-energy rest blending")
+    parser.add_argument("--rest-blend", type=float, default=0.5,
+                        help="Blend strength toward normalized rest pose for low-energy frames")
     parser.add_argument("--text-cpu", action="store_true")
     parser.add_argument("--wavlm-cpu", action="store_true")
     args = parser.parse_args()
@@ -290,6 +325,8 @@ def main():
         raise ValueError("--smooth-window must be at least 1")
     if args.velocity_scale <= 0:
         raise ValueError("--velocity-scale must be positive")
+    if not 0.0 <= args.rest_blend <= 1.0:
+        raise ValueError("--rest-blend must be in [0, 1]")
 
     model = LatentDenoiser(**latent_model_kwargs(model_config)).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -321,6 +358,13 @@ def main():
         sample_steps=args.sample_steps,
         guidance_scale=args.guidance_scale,
     )
+    energy_labels = energy_labels_for_features(features, dataset_metadata, stats)
+    pred_norm = apply_energy_rest_gate(
+        pred_norm,
+        energy_labels,
+        enabled=args.energy_gate,
+        rest_blend=args.rest_blend,
+    )
     pred_angles = reconstruct_nao_angles(pred_norm, stats, target_mode).astype(np.float32)
     pred_angles = smooth_nao_angles(pred_angles, args.smooth_window).astype(np.float32)
     pred_angles = clamp_nao_angles(pred_angles).astype(np.float32)
@@ -351,6 +395,13 @@ def main():
             "smooth_window": args.smooth_window,
             "velocity_limit": args.velocity_limit,
             "velocity_scale": args.velocity_scale,
+            "energy_gate": args.energy_gate,
+            "rest_blend": args.rest_blend,
+            "energy_label_counts": (
+                np.bincount(energy_labels, minlength=3).astype(int).tolist()
+                if energy_labels is not None
+                else None
+            ),
             "speaker_id": args.speaker_id or (speaker_id_from_clip_id(args.clip_id) if args.clip_id else None),
             "diffusion_seed_frames": seed_frames,
             "num_frames": int(pred_angles.shape[0]),

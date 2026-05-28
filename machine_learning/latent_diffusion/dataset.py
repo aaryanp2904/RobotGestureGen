@@ -38,6 +38,26 @@ def validate_source_metadata(metadata: dict, source: PreprocessedGestureDataset,
     checks = [
         ("input_dim", int(metadata.get("input_dim", 0) or 0), int(source.metadata.get("input_dim", 0) or 0)),
         (
+            "prosody_dim",
+            int(metadata.get("prosody_dim", 0) or 0),
+            int(source.metadata.get("prosody_dim", 0) or 0),
+        ),
+        (
+            "wavlm_dim",
+            int(metadata.get("wavlm_dim", 0) or 0),
+            int(source.metadata.get("wavlm_dim", 0) or 0),
+        ),
+        (
+            "text_dim",
+            int(metadata.get("text_dim", 0) or 0),
+            int(source.metadata.get("text_dim", 0) or 0),
+        ),
+        (
+            "gesture_energy_dim",
+            int(metadata.get("gesture_energy_dim", 0) or 0),
+            int(source.metadata.get("gesture_energy_dim", 0) or 0),
+        ),
+        (
             "speaker_dim",
             int(metadata.get("speaker_dim", 0) or 0),
             int(source.metadata.get("speaker_dim", 0) or 0),
@@ -87,6 +107,18 @@ def validate_source_metadata(metadata: dict, source: PreprocessedGestureDataset,
     source_feature_names = _metadata_list(source.metadata.get("feature_names"))
     if feature_names and source_feature_names and feature_names != source_feature_names:
         raise ValueError(f"Source dataset {source.data_dir} feature_names do not match latent metadata")
+
+    for key in (
+        "conditioning_parts",
+        "gesture_energy_names",
+        "gesture_energy_feature_names",
+        "gesture_energy_thresholds",
+        "gesture_energy_audio_thresholds",
+    ):
+        expected = _metadata_list(metadata.get(key))
+        actual = _metadata_list(source.metadata.get(key))
+        if expected and actual and expected != actual:
+            raise ValueError(f"Source dataset {source.data_dir} {key} does not match latent metadata")
 
 
 class LatentGestureDataset(torch.utils.data.Dataset):

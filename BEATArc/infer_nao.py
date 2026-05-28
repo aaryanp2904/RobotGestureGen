@@ -61,6 +61,8 @@ try:
     from .nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
     from .parse_annotations import parse_textgrid
     from .preprocess_nao import (
+        ENERGY_CLUSTER_NAMES,
+        ENERGY_FEATURE_NAMES,
         PROSODY_FEATURE_NAMES,
         TEXT_EMBED_DIM,
         DEFAULT_WAVLM_MODEL,
@@ -76,6 +78,8 @@ except ImportError:
     from nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
     from parse_annotations import parse_textgrid
     from preprocess_nao import (
+        ENERGY_CLUSTER_NAMES,
+        ENERGY_FEATURE_NAMES,
         PROSODY_FEATURE_NAMES,
         TEXT_EMBED_DIM,
         DEFAULT_WAVLM_MODEL,
@@ -165,6 +169,9 @@ def validate_inference_contract(model_config: dict, stats: dict, dataset_metadat
     wavlm_dim = int(dataset_metadata.get("wavlm_dim", stats.get("wavlm_dim", 0)) or 0)
     if wavlm_dim > 0:
         required_stats.extend(["wavlm_mean", "wavlm_std"])
+    gesture_energy_dim = int(dataset_metadata.get("gesture_energy_dim", 0) or 0)
+    if gesture_energy_dim > 0:
+        required_stats.extend(["gesture_energy_thresholds", "gesture_energy_audio_thresholds"])
 
     missing = [key for key in required_stats if key not in stats]
     if missing:
@@ -197,6 +204,18 @@ def validate_inference_contract(model_config: dict, stats: dict, dataset_metadat
             raise ValueError(
                 f"Checkpoint prosody feature order does not match inference order: {metadata_features}"
             )
+        if metadata_features is not None:
+            expected_features = (
+                list(PROSODY_FEATURE_NAMES)
+                + [f"wavlm_{idx:04d}" for idx in range(int(dataset_metadata.get("wavlm_dim", 0) or 0))]
+                + [f"text_{idx:04d}" for idx in range(int(dataset_metadata.get("text_dim", 0) or 0))]
+                + list(ENERGY_FEATURE_NAMES[:gesture_energy_dim])
+            )
+            if list(metadata_features) != expected_features:
+                raise ValueError(
+                    "Checkpoint feature_names do not match inference feature layout: "
+                    f"expected {expected_features}, got {metadata_features}"
+                )
         metadata_shape = tuple(dataset_metadata.get("target_shape", ()))
         if metadata_shape and metadata_shape != tuple(model_config["target_shape"]):
             raise ValueError(
@@ -210,6 +229,43 @@ def validate_inference_contract(model_config: dict, stats: dict, dataset_metadat
                 f"does not match dataset_metadata input_dim {metadata_input_dim}"
             )
     return target_mode
+
+
+def infer_energy_features_from_prosody(
+    normalized_prosody: np.ndarray,
+    stats: dict,
+    dataset_metadata: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Infer low/medium/high activity labels from audio prosody at inference."""
+    dim = int(dataset_metadata.get("gesture_energy_dim", 0) or 0)
+    if dim <= 0:
+        return np.zeros((normalized_prosody.shape[0], 0), dtype=np.float32), np.zeros(
+            (normalized_prosody.shape[0],), dtype=np.int64
+        )
+    if dim != len(ENERGY_CLUSTER_NAMES):
+        raise ValueError(f"Unsupported gesture_energy_dim={dim}; expected {len(ENERGY_CLUSTER_NAMES)}")
+
+    name_to_idx = {name: idx for idx, name in enumerate(PROSODY_FEATURE_NAMES)}
+    rms = normalized_prosody[:, name_to_idx["rms"]]
+    log_rms = normalized_prosody[:, name_to_idx["log_rms"]]
+    onset = normalized_prosody[:, name_to_idx["onset_strength"]]
+    voiced = normalized_prosody[:, name_to_idx["voiced"]]
+    activity = 0.5 * rms + 0.3 * log_rms + 0.2 * onset + 0.1 * voiced
+    thresholds = np.array(
+        dataset_metadata.get("gesture_energy_audio_thresholds")
+        or stats.get("gesture_energy_audio_thresholds")
+        or [-0.25, 0.75],
+        dtype=np.float32,
+    )
+    if thresholds.shape != (2,):
+        raise ValueError("gesture_energy_audio_thresholds must contain [low, high]")
+    labels = np.zeros((len(activity),), dtype=np.int64)
+    labels[activity > thresholds[0]] = 1
+    labels[activity > thresholds[1]] = 2
+    features = np.zeros((len(activity), dim), dtype=np.float32)
+    if len(activity) > 0:
+        features[np.arange(len(activity)), labels] = 1.0
+    return features, labels
 
 
 def build_features(wav_path: Path, words: list[dict], model_config: dict,
@@ -238,7 +294,8 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
     metadata_has_text = dataset_metadata.get("text_dim") is not None
     wavlm_dim = int(dataset_metadata.get("wavlm_dim", 0) or 0)
     text_dim = int(dataset_metadata.get("text_dim", 0) or 0)
-    remaining_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES)
+    gesture_energy_dim = int(dataset_metadata.get("gesture_energy_dim", 0) or 0)
+    remaining_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - gesture_energy_dim
     if not metadata_has_wavlm and not metadata_has_text:
         # Older checkpoints may be paired with newer stats files. In that case
         # trust the checkpoint input size instead of blindly using stats wavlm_dim.
@@ -260,19 +317,19 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
                 "Use a checkpoint with dataset_metadata or matching preprocessing stats."
             )
     elif not metadata_has_wavlm:
-        wavlm_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - text_dim
+        wavlm_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - text_dim - gesture_energy_dim
     elif not metadata_has_text:
-        text_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - wavlm_dim
+        text_dim = expected_input_dim - len(PROSODY_FEATURE_NAMES) - wavlm_dim - gesture_energy_dim
     if wavlm_dim < 0 or text_dim < 0:
         raise ValueError(
             f"Checkpoint input_dim {expected_input_dim} is inconsistent with "
             f"prosody={len(PROSODY_FEATURE_NAMES)}, wavlm={wavlm_dim}, text={text_dim}"
         )
-    expected_parts_dim = len(PROSODY_FEATURE_NAMES) + wavlm_dim + text_dim
+    expected_parts_dim = len(PROSODY_FEATURE_NAMES) + wavlm_dim + text_dim + gesture_energy_dim
     if expected_parts_dim != expected_input_dim:
         raise ValueError(
             f"Checkpoint input_dim {expected_input_dim} does not equal "
-            f"prosody+wavlm+text dims ({expected_parts_dim})"
+            f"prosody+wavlm+text+gesture_energy dims ({expected_parts_dim})"
         )
     feature_parts = [prosody.astype(np.float32)]
 
@@ -300,6 +357,9 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
         feature_parts.append(((wavlm_features - wavlm_mean) / wavlm_std).astype(np.float32))
 
     if text_dim == 0:
+        energy_features, _ = infer_energy_features_from_prosody(prosody, stats, dataset_metadata)
+        if energy_features.shape[1] > 0:
+            feature_parts.append(energy_features)
         features = np.concatenate(feature_parts, axis=1).astype(np.float32)
         if features.shape[1] != expected_input_dim:
             raise ValueError(f"Built {features.shape[1]} input dims, checkpoint expects {expected_input_dim}")
@@ -320,6 +380,9 @@ def build_features(wav_path: Path, words: list[dict], model_config: dict,
         )
 
     feature_parts.append(text_features.astype(np.float32))
+    energy_features, _ = infer_energy_features_from_prosody(prosody, stats, dataset_metadata)
+    if energy_features.shape[1] > 0:
+        feature_parts.append(energy_features)
     features = np.concatenate(feature_parts, axis=1).astype(np.float32)
     if features.shape[1] != expected_input_dim:
         raise ValueError(f"Built {features.shape[1]} input dims, checkpoint expects {expected_input_dim}")

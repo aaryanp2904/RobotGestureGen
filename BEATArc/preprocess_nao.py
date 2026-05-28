@@ -65,6 +65,8 @@ PROSODY_FEATURE_NAMES = [
     "delta_log_rms",
 ]
 
+ENERGY_CLUSTER_NAMES = ["low", "medium", "high"]
+ENERGY_FEATURE_NAMES = [f"gesture_energy_{name}" for name in ENERGY_CLUSTER_NAMES]
 TEXT_EMBED_DIM = 768
 DEFAULT_WAVLM_MODEL = "microsoft/wavlm-base-plus"
 WAVLM_SAMPLE_RATE = 16000
@@ -379,6 +381,52 @@ def frame_velocity(values: np.ndarray) -> np.ndarray:
     return vel
 
 
+def motion_energy_from_velocity(velocity: np.ndarray) -> np.ndarray:
+    """Per-frame gesture activity from target joint velocity magnitude."""
+    if velocity.size == 0:
+        return np.zeros((0,), dtype=np.float32)
+    return np.mean(np.abs(velocity.astype(np.float32)), axis=1)
+
+
+def fit_energy_thresholds(energies: list[np.ndarray]) -> tuple[float, float]:
+    values = [energy.reshape(-1) for energy in energies if energy.size > 0]
+    if not values:
+        return 0.0, 0.0
+    all_values = np.concatenate(values).astype(np.float32)
+    low_thr, high_thr = np.quantile(all_values, [0.50, 0.85])
+    if high_thr < low_thr:
+        high_thr = low_thr
+    return float(low_thr), float(high_thr)
+
+
+def energy_labels_from_values(energy: np.ndarray, low_thr: float, high_thr: float) -> np.ndarray:
+    labels = np.zeros((len(energy),), dtype=np.int64)
+    labels[energy > low_thr] = 1
+    labels[energy > high_thr] = 2
+    return labels
+
+
+def one_hot_energy(labels: np.ndarray) -> np.ndarray:
+    out = np.zeros((len(labels), len(ENERGY_CLUSTER_NAMES)), dtype=np.float32)
+    if len(labels) > 0:
+        out[np.arange(len(labels)), np.clip(labels, 0, len(ENERGY_CLUSTER_NAMES) - 1)] = 1.0
+    return out
+
+
+def audio_activity_from_prosody(prosody: np.ndarray, prosody_mean: np.ndarray | None = None,
+                                prosody_std: np.ndarray | None = None) -> np.ndarray:
+    values = prosody.astype(np.float32)
+    if prosody_mean is not None and prosody_std is not None:
+        values = (values - prosody_mean.astype(np.float32)) / prosody_std.astype(np.float32)
+    name_to_idx = {name: idx for idx, name in enumerate(PROSODY_FEATURE_NAMES)}
+    return (
+        0.5 * values[:, name_to_idx["rms"]]
+        + 0.3 * values[:, name_to_idx["log_rms"]]
+        + 0.2 * values[:, name_to_idx["onset_strength"]]
+        + 0.1 * values[:, name_to_idx["voiced"]]
+    ).astype(np.float32)
+
+
 def window_starts(total_frames: int, window_frames: int, stride_frames: int) -> list[int]:
     if total_frames <= window_frames:
         return [0]
@@ -537,6 +585,13 @@ def save_stats(output_dir: Path, stats: dict):
     if int(stats.get("wavlm_dim", 0)) > 0:
         arrays["wavlm_mean"] = np.array(stats["wavlm_mean"], dtype=np.float32)
         arrays["wavlm_std"] = np.array(stats["wavlm_std"], dtype=np.float32)
+    if int(stats.get("gesture_energy_dim", 0)) > 0:
+        arrays["gesture_energy_thresholds"] = np.array(
+            stats["gesture_energy_thresholds"], dtype=np.float32
+        )
+        arrays["gesture_energy_audio_thresholds"] = np.array(
+            stats["gesture_energy_audio_thresholds"], dtype=np.float32
+        )
     np.savez(str(output_dir / "normalization_stats.npz"), **arrays)
 
 
@@ -569,6 +624,7 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
         raise ValueError("NAO velocity stats do not match the configured joint count")
     speaker_id_map = speaker_id_map or {}
     conditioning_parts = conditioning_parts or ["prosody"]
+    gesture_energy_dim = int(stats.get("gesture_energy_dim", 0) or 0)
     speaker_dim = len(speaker_id_map)
     clips_dir = output_dir / "clips"
     rows_by_split = {}
@@ -613,7 +669,16 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
                 raise ValueError(
                     f"{clip_id} text dim {text_features.shape[1]} does not match {text_dim}"
                 )
-            x = np.concatenate([prosody, wavlm_features, text_features], axis=1)
+            if gesture_energy_dim:
+                energy_features = data["gesture_energy_onehot"].astype(np.float32)
+                if energy_features.shape[1] != gesture_energy_dim:
+                    raise ValueError(
+                        f"{clip_id} gesture energy dim {energy_features.shape[1]} "
+                        f"does not match {gesture_energy_dim}"
+                    )
+            else:
+                energy_features = np.zeros((len(prosody), 0), dtype=np.float32)
+            x = np.concatenate([prosody, wavlm_features, text_features, energy_features], axis=1)
             y = select_training_target(data, stats, target_mode)
             if len(x) != len(y):
                 raise ValueError(f"{clip_id} feature/target length mismatch: x={len(x)} y={len(y)}")
@@ -661,11 +726,20 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
             "window_frames": window_frames,
             "stride_frames": stride_frames,
             "fps": MOCAP_FPS,
-            "input_dim": len(PROSODY_FEATURE_NAMES) + wavlm_dim + text_dim,
+            "input_dim": len(PROSODY_FEATURE_NAMES) + wavlm_dim + text_dim + gesture_energy_dim,
             "prosody_dim": len(PROSODY_FEATURE_NAMES),
             "wavlm_dim": wavlm_dim,
             "wavlm_model": stats.get("wavlm_model"),
+            "include_wavlm": bool(wavlm_dim > 0),
+            "include_text": bool(text_dim > 0),
             "text_dim": text_dim,
+            "gesture_energy_dim": gesture_energy_dim,
+            "gesture_energy_names": stats.get("gesture_energy_names", ENERGY_CLUSTER_NAMES),
+            "gesture_energy_feature_names": stats.get("gesture_energy_feature_names", ENERGY_FEATURE_NAMES),
+            "gesture_energy_thresholds": stats.get("gesture_energy_thresholds", []),
+            "gesture_energy_audio_thresholds": stats.get("gesture_energy_audio_thresholds", []),
+            "gesture_energy_source": stats.get("gesture_energy_source", "motion_velocity"),
+            "gesture_energy_inference_source": stats.get("gesture_energy_inference_source", "prosody_activity"),
             "speaker_dim": speaker_dim,
             "speaker_id_map": speaker_id_map,
             "target_shape": [len(NAO_JOINTS)],
@@ -683,6 +757,7 @@ def write_lmdb(output_dir: Path, manifest_rows: list[dict], stats: dict,
                 PROSODY_FEATURE_NAMES
                 + [f"wavlm_{idx:04d}" for idx in range(wavlm_dim)]
                 + [f"text_{idx:04d}" for idx in range(text_dim)]
+                + ENERGY_FEATURE_NAMES[:gesture_energy_dim]
             ),
             "target_names": NAO_JOINTS,
             "nao_mean": stats["nao_mean"],
@@ -759,6 +834,8 @@ def preprocess(args):
         conditioning_parts.append("wavlm")
     if args.include_text:
         conditioning_parts.append("text")
+    if args.include_energy_clusters:
+        conditioning_parts.append("gesture_energy")
 
     processed = []
     dropped = {
@@ -769,6 +846,7 @@ def preprocess(args):
         "failed": [],
     }
     total_frames = 0
+    train_motion_energies = []
 
     for row in tqdm(split_rows, desc="Preprocessing BEAT2 clips"):
         clip_id = row["id"]
@@ -803,6 +881,7 @@ def preprocess(args):
                 poses, fps=fps, velocity_limit=args.velocity_limit
             )
             nao_velocity = frame_velocity(nao_angles)
+            motion_energy = motion_energy_from_velocity(nao_velocity)
             prosody = extract_prosody(wav_path, poses.shape[0], fps=fps)
             words = load_words(clip_id)
             if args.include_text:
@@ -865,6 +944,7 @@ def preprocess(args):
                     wavlm_stats.update(wavlm_features)
                 nao_stats.update(nao_angles)
                 vel_stats.update(nao_velocity)
+                train_motion_energies.append(motion_energy)
         except Exception as exc:
             print(f"[WARN] Failed {clip_id}: {exc}")
             dropped["failed"].append(clip_id)
@@ -885,6 +965,7 @@ def preprocess(args):
         wavlm_std = np.ones((0,), dtype=np.float32)
     nao_mean, nao_std = nao_stats.finalise()
     vel_mean, vel_std = vel_stats.finalise()
+    energy_low_thr, energy_high_thr = fit_energy_thresholds(train_motion_energies)
     if prosody_stats.n == 0:
         raise RuntimeError(
             "No training frames were found. Run preprocessing with the train split "
@@ -892,6 +973,15 @@ def preprocess(args):
         )
     train_rows = [row for row in processed if row["split"] == "train"]
     speaker_id_map = build_speaker_id_map(train_rows)
+    train_audio_activity = []
+    for row in train_rows:
+        clip_path = clips_dir / f"{row['id']}.npz"
+        if clip_path.is_file():
+            with np.load(str(clip_path), allow_pickle=True) as clip_data:
+                train_audio_activity.append(
+                    audio_activity_from_prosody(clip_data["prosody"], prosody_mean, prosody_std)
+                )
+    audio_low_thr, audio_high_thr = fit_energy_thresholds(train_audio_activity)
     stats = {
         "prosody_feature_names": PROSODY_FEATURE_NAMES,
         "nao_joint_names": NAO_JOINTS,
@@ -901,6 +991,9 @@ def preprocess(args):
         "wavlm_std": wavlm_std.tolist(),
         "wavlm_dim": wavlm_dim,
         "wavlm_model": args.wavlm_model if args.include_wavlm else None,
+        "include_wavlm": args.include_wavlm,
+        "include_text": args.include_text,
+        "text_dim": text_dim,
         "nao_mean": nao_mean.tolist(),
         "nao_std": nao_std.tolist(),
         "motion_mean": nao_mean.tolist(),
@@ -914,11 +1007,41 @@ def preprocess(args):
         "target_mode": args.target_mode,
         "target_representation": args.target_representation,
         "conditioning_parts": conditioning_parts,
+        "feature_names": (
+            PROSODY_FEATURE_NAMES
+            + [f"wavlm_{idx:04d}" for idx in range(wavlm_dim)]
+            + [f"text_{idx:04d}" for idx in range(text_dim)]
+            + (ENERGY_FEATURE_NAMES if args.include_energy_clusters else [])
+        ),
+        "gesture_energy_dim": len(ENERGY_CLUSTER_NAMES) if args.include_energy_clusters else 0,
+        "gesture_energy_names": ENERGY_CLUSTER_NAMES if args.include_energy_clusters else [],
+        "gesture_energy_feature_names": ENERGY_FEATURE_NAMES if args.include_energy_clusters else [],
+        "gesture_energy_thresholds": [energy_low_thr, energy_high_thr] if args.include_energy_clusters else [],
+        "gesture_energy_audio_thresholds": [audio_low_thr, audio_high_thr] if args.include_energy_clusters else [],
+        "gesture_energy_source": "motion_velocity",
+        "gesture_energy_inference_source": "prosody_activity",
         "prediction_type": args.prediction_type,
         "fps": MOCAP_FPS,
         "num_train_frames": prosody_stats.n,
     }
     save_stats(output_dir, stats)
+
+    if args.include_energy_clusters:
+        for row in processed:
+            clip_id = row["id"]
+            clip_path = clips_dir / f"{clip_id}.npz"
+            with np.load(str(clip_path), allow_pickle=True) as clip_data:
+                payload = {key: clip_data[key] for key in clip_data.files}
+            labels = energy_labels_from_values(
+                motion_energy_from_velocity(payload["nao_velocity"]),
+                energy_low_thr,
+                energy_high_thr,
+            )
+            payload["gesture_energy"] = motion_energy_from_velocity(payload["nao_velocity"])
+            payload["gesture_energy_labels"] = labels.astype(np.int64)
+            payload["gesture_energy_onehot"] = one_hot_energy(labels)
+            payload["gesture_energy_names"] = np.array(ENERGY_CLUSTER_NAMES)
+            np.savez_compressed(str(clip_path), **payload)
 
     summary = {
         "processed": len(processed),
@@ -937,6 +1060,11 @@ def preprocess(args):
         "include_wavlm": args.include_wavlm,
         "wavlm_model": args.wavlm_model if args.include_wavlm else None,
         "wavlm_feature_dim": wavlm_dim,
+        "include_energy_clusters": args.include_energy_clusters,
+        "gesture_energy_dim": stats["gesture_energy_dim"],
+        "gesture_energy_thresholds": stats["gesture_energy_thresholds"],
+        "gesture_energy_audio_thresholds": stats["gesture_energy_audio_thresholds"],
+        "gesture_energy_names": stats["gesture_energy_names"],
         "feature_cache_dir": str(cache_dir),
         "speaker_id_map": speaker_id_map,
         "window_seconds": args.window_size,
@@ -1005,6 +1133,12 @@ def main():
                         help="Hugging Face WavLM model name")
     parser.add_argument("--wavlm-cpu", action="store_true",
                         help="Run WavLM feature extraction on CPU even if CUDA is available")
+    parser.add_argument("--include-energy-clusters", dest="include_energy_clusters",
+                        action="store_true", default=True,
+                        help="Add low/medium/high gesture-energy conditioning features (default)")
+    parser.add_argument("--no-energy-clusters", dest="include_energy_clusters",
+                        action="store_false",
+                        help="Disable gesture-energy conditioning features")
     parser.add_argument("--velocity-limit", action="store_true",
                         help="Apply NAO speed limiting to stored training targets")
     parser.add_argument("--target-mode", choices=["angle", "delta"], default="angle",
