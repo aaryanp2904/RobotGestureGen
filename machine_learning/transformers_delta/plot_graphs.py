@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Evaluate Transformer gesture predictions against ground-truth motion.
+"""Evaluate delta-transformer gesture predictions against ground-truth motion.
 
 The goal is to produce dissertation-quality evidence for whether the
-Transformer baseline collapses toward low-amplitude, low-diversity gestures.
+Delta Transformer baseline collapses toward low-amplitude, low-diversity gestures.
 All inputs are .npy files with matching filenames in the ground-truth and
-Transformer folders.
+Delta Transformer folders.
 """
 
 from __future__ import annotations
@@ -31,9 +31,9 @@ UNIT_ANGLE_SQ = "rad²"
 UNIT_VELOCITY = "rad/s"
 UNIT_ENERGY = "rad²/frame"
 
-DATASET_ORDER = ["Ground Truth", "Transformer"]
-DATASET_KEYS = {"Ground Truth": "ground_truth", "Transformer": "transformer"}
-COLORS = {"Ground Truth": "#2E86AB", "Transformer": "#D1495B"}
+DATASET_ORDER = ["Ground Truth", "Delta Transformer"]
+DATASET_KEYS = {"Ground Truth": "ground_truth", "Delta Transformer": "transformer_delta"}
+COLORS = {"Ground Truth": "#2E86AB", "Delta Transformer": "#D1495B"}
 ARM_JOINTS = [
     "LShoulderPitch",
     "LShoulderRoll",
@@ -166,7 +166,7 @@ def discover_matched_files(gt_dir: Path, transformer_dir: Path, pattern: str) ->
     transformer_files = {path.name for path in transformer_dir.glob(pattern)}
     matched = sorted(gt_files & transformer_files)
     if not matched:
-        raise RuntimeError("No matching files found across ground-truth and Transformer folders.")
+        raise RuntimeError("No matching files found across ground-truth and Delta Transformer folders.")
     missing_transformer = sorted(gt_files - transformer_files)
     if missing_transformer:
         print(f"[WARN] {len(missing_transformer)} GT files missing from transformer folder")
@@ -176,9 +176,9 @@ def discover_matched_files(gt_dir: Path, transformer_dir: Path, pattern: str) ->
 def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, list[np.ndarray]]]:
     dirs = {
         "Ground Truth": Path(args.ground_truth_dir),
-        "Transformer": Path(args.transformer_dir),
+        "Delta Transformer": Path(args.transformer_dir),
     }
-    filenames = discover_matched_files(dirs["Ground Truth"], dirs["Transformer"], args.pattern)
+    filenames = discover_matched_files(dirs["Ground Truth"], dirs["Delta Transformer"], args.pattern)
     data = {name: [] for name in DATASET_ORDER}
     names: list[str] | None = None
 
@@ -205,6 +205,27 @@ def save_figure(output_dir: Path, stem: str) -> None:
     plt.close()
 
 
+def format_value(value: float) -> str:
+    if value == 0:
+        return "0"
+    if abs(value) < 1e-3 or abs(value) >= 1e3:
+        return f"{value:.2e}"
+    return f"{value:.4f}".rstrip("0").rstrip(".")
+
+
+def maybe_use_symlog_y(values: list[np.ndarray] | list[float]) -> None:
+    finite = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = finite[np.isfinite(finite)]
+    positive = finite[finite > 0]
+    if positive.size < 2:
+        return
+    dynamic_range = float(positive.max() / max(positive.min(), 1e-12))
+    if dynamic_range < 100.0:
+        return
+    linthresh = max(float(positive.min()) / 10.0, 1e-9)
+    plt.yscale("symlog", linthresh=linthresh)
+
+
 def bar_with_error(
     output_dir: Path,
     stem: str,
@@ -221,8 +242,8 @@ def bar_with_error(
         for label in DATASET_ORDER
     ]
     x = np.arange(len(DATASET_ORDER))
-    plt.figure(figsize=(7, 6))
-    plt.bar(
+    plt.figure(figsize=(8.5, 6))
+    bars = plt.bar(
         x,
         means,
         yerr=sems,
@@ -231,9 +252,22 @@ def bar_with_error(
         edgecolor="black",
         linewidth=0.7,
     )
+    maybe_use_symlog_y(means)
+    for bar, mean in zip(bars, means):
+        y = bar.get_height()
+        va = "bottom" if y >= 0 else "top"
+        plt.annotate(
+            format_value(mean),
+            xy=(bar.get_x() + bar.get_width() / 2, y),
+            xytext=(0, 5 if y >= 0 else -5),
+            textcoords="offset points",
+            ha="center",
+            va=va,
+            fontsize=10,
+        )
     plt.xticks(x, [f"{label}\n(n={sample_counts[label]})" for label in DATASET_ORDER])
     plt.ylabel(ylabel)
-    plt.title(title)
+    plt.title(title, wrap=True)
     save_figure(output_dir, stem)
 
 
@@ -245,11 +279,12 @@ def boxplot_metric(output_dir: Path, stem: str, title: str, ylabel: str, values:
         patch_artist=True,
         showfliers=False,
     )
+    maybe_use_symlog_y([values[dataset] for dataset in DATASET_ORDER])
     for patch, label in zip(box["boxes"], DATASET_ORDER):
         patch.set_facecolor(COLORS[label])
         patch.set_alpha(0.65)
     plt.ylabel(ylabel)
-    plt.title(title)
+    plt.title(title, wrap=True)
     save_figure(output_dir, stem)
 
 
@@ -264,6 +299,7 @@ def grouped_joint_plot(
     x = np.arange(len(joint_names))
     width = 0.34
     plt.figure(figsize=(max(10, 0.55 * len(joint_names)), 6))
+    maybe_use_symlog_y([values[dataset] for dataset in DATASET_ORDER])
     for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
         plt.bar(
             x + offset,
@@ -276,7 +312,7 @@ def grouped_joint_plot(
         )
     plt.xticks(x, joint_names, rotation=45, ha="right")
     plt.ylabel(ylabel)
-    plt.title(title)
+    plt.title(title, wrap=True)
     plt.legend()
     save_figure(output_dir, stem)
 
@@ -349,7 +385,7 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
     split = len(sampled["Ground Truth"])
     chunks = {
         "Ground Truth": projected[:split],
-        "Transformer": projected[split:],
+        "Delta Transformer": projected[split:],
     }
     plt.figure(figsize=(9, 7))
     for dataset in DATASET_ORDER:
@@ -365,7 +401,7 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         )
     plt.xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
     plt.ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
-    plt.title("PCA Motion Coverage: Ground Truth vs Transformer")
+    plt.title("PCA Motion Coverage: Ground Truth vs Delta Transformer")
     plt.legend(markerscale=2)
     save_figure(output_dir, "10_pca_motion_coverage")
 
@@ -406,7 +442,7 @@ def statistical_tests(metrics: dict[str, dict[str, np.ndarray]]) -> dict:
     results = {}
     for metric_name, by_dataset in metrics.items():
         gt = np.asarray(by_dataset["Ground Truth"], dtype=np.float64)
-        transformer = np.asarray(by_dataset["Transformer"], dtype=np.float64)
+        transformer = np.asarray(by_dataset["Delta Transformer"], dtype=np.float64)
         t_stat, t_p = try_welch_t(gt, transformer)
         u_stat, u_p = try_mann_whitney(gt, transformer)
         results[metric_name] = {
@@ -459,21 +495,25 @@ def serialise_metrics(metrics: dict[str, dict[str, np.ndarray]]) -> dict:
 
 
 def print_summary_table(metrics: dict[str, dict[str, np.ndarray]], tests: dict) -> None:
-    print("\n[SUMMARY] Ground Truth vs Transformer")
-    header = f"{'Metric':<32} {'GT mean':>12} {'Transformer':>12} {'Welch p':>12} {'Cohen d':>10}"
+    print("\n[SUMMARY] Ground Truth vs Delta Transformer")
+    header = f"{'Metric':<32} {'GT mean':>12} {'Delta Tx':>12} {'Welch p':>12} {'Cohen d':>10}"
     print(header)
     print("-" * len(header))
     for metric_name, by_dataset in metrics.items():
         gt = np.mean(by_dataset["Ground Truth"])
-        tr = np.mean(by_dataset["Transformer"])
+        tr = np.mean(by_dataset["Delta Transformer"])
         row = tests[metric_name]["ground_truth_vs_transformer"]
         p_value = row.get("welch_t_pvalue")
         p_text = f"{p_value:.2e}" if p_value is not None else "n/a"
-        print(f"{metric_name:<32} {gt:12.4f} {tr:12.4f} {p_text:>12} {row['cohens_d_gt_minus_transformer']:10.3f}")
+        print(
+            f"{metric_name:<32} {format_value(float(gt)):>12} "
+            f"{format_value(float(tr)):>12} {p_text:>12} "
+            f"{row['cohens_d_gt_minus_transformer']:10.3f}"
+        )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Transformer gestures against ground truth")
+    parser = argparse.ArgumentParser(description="Evaluate Delta Transformer gestures against ground truth")
     parser.add_argument("--ground-truth-dir", required=True)
     parser.add_argument("--transformer-dir", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -564,7 +604,7 @@ def main() -> None:
     bar_with_error(
         output_dir,
         "01_mean_motion_energy",
-        "Mean Motion Energy: Ground Truth vs Transformer",
+        "Mean Motion Energy: Ground Truth vs Delta Transformer",
         f"Motion energy ({UNIT_ENERGY})",
         metrics_for_tests["motion_energy"],
         sample_counts,
@@ -588,7 +628,7 @@ def main() -> None:
     grouped_joint_plot(
         output_dir,
         "03_jointwise_range_comparison",
-        "Joint-Wise Range of Motion: Ground Truth vs Transformer",
+        "Joint-Wise Range of Motion: Ground Truth vs Delta Transformer",
         f"Range ({UNIT_ANGLE})",
         joint_names,
         joint_mean_range,
@@ -596,7 +636,7 @@ def main() -> None:
     grouped_joint_plot(
         output_dir,
         "04_jointwise_velocity_comparison",
-        "Joint-Wise Mean Absolute Velocity: Ground Truth vs Transformer",
+        "Joint-Wise Mean Absolute Velocity: Ground Truth vs Delta Transformer",
         f"Mean |velocity| ({UNIT_VELOCITY})",
         joint_names,
         joint_mean_velocity,
