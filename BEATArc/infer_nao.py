@@ -22,9 +22,8 @@ import torchaudio
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-sys.path.insert(0, str(REPO_ROOT / "machine_learning" / "transformers"))
 
-from pos_end import GestureTransformer
+from machine_learning.transformers.model import GestureTransformer
 from machine_learning.diffusion import ConditionalMotionDenoiser, DiffusionSchedule
 
 MODEL_INIT_KEYS = {"input_dim", "hidden_dim", "num_heads", "num_layers", "num_joints", "target_shape"}

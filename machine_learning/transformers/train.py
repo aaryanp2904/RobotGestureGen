@@ -1,99 +1,84 @@
-"""
-Train a GestureTransformer model on a preprocessed LMDB gesture dataset.
+#!/usr/bin/env python3
+"""Train the BEAT2/NAO GestureTransformer on preprocessed LMDB windows."""
 
-Usage:
-    python train.py --data-dir /path/to/dataset.lmdb --epochs 50
-    python train.py --data-dir /path/to/train.lmdb --val-data-dir /path/to/val.lmdb
-    python train.py --data-dir /path/to/dataset.lmdb --sanity-check
-    python train.py --data-dir /path/to/train.lmdb --velocity-loss-weight 2.0
-"""
+from __future__ import annotations
 
+import argparse
+import math
+import pickle
+import time
+from pathlib import Path
+
+import lmdb
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
-import argparse
-import time
-import lmdb
-import pickle
-import numpy as np
+from torch.utils.data import DataLoader, Dataset
 
-from pos_end import GestureTransformer
+try:
+    from .model import GestureTransformer, model_init_kwargs
+except ImportError:
+    from model import GestureTransformer, model_init_kwargs
 
-
-MODEL_INIT_KEYS = {"input_dim", "hidden_dim", "num_heads", "num_layers", "num_joints", "target_shape"}
-
-
-def model_init_kwargs(model_config: dict) -> dict:
-    return {key: value for key, value in model_config.items() if key in MODEL_INIT_KEYS}
-
-
-def unpack_batch(batch):
-    if len(batch) == 3:
-        return batch
-    bx, by = batch
-    return bx, by, None
-
-
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
 
 class PreprocessedLMDBDataset(Dataset):
-    """
-    Lazily reads sliding windows from an LMDB database.
+    """Lazy LMDB dataset for transformer windows."""
 
-    BEAT2 windows can be large, especially with text embeddings, so loading the
-    whole database into RAM can be killed by the OS. Keep one read-only LMDB
-    handle per process instead.
-    """
-
-    def __init__(self, lmdb_dir):
+    def __init__(self, lmdb_dir: str | Path):
         self.lmdb_dir = str(Path(lmdb_dir))
         self._env = None
         env = lmdb.open(
-            self.lmdb_dir, readonly=True, lock=False, readahead=False,
-            meminit=False, max_readers=2048,
+            self.lmdb_dir,
+            readonly=True,
+            lock=False,
+            readahead=False,
+            meminit=False,
+            max_readers=2048,
         )
-
         with env.begin() as txn:
             length_bytes = txn.get(b"__len__")
+            metadata_bytes = txn.get(b"__metadata__")
             if length_bytes is None:
                 raise ValueError(f"No b'__len__' key in LMDB at {self.lmdb_dir}")
-            self.length = pickle.loads(length_bytes)
-            metadata_bytes = txn.get(b"__metadata__")
-            self.metadata = pickle.loads(metadata_bytes) if metadata_bytes else {
-                "input_dim": 1536,
-                "target_shape": [12, 3],
-                "target_type": "genea_root_relative_xyz",
-            }
-
+            if metadata_bytes is None:
+                raise ValueError(f"No b'__metadata__' key in LMDB at {self.lmdb_dir}")
+            self.length = int(pickle.loads(length_bytes))
+            self.metadata = pickle.loads(metadata_bytes)
+            validate_transformer_metadata(self.metadata, self.lmdb_dir)
         env.close()
 
-        print(f"[DATASET] Lazy LMDB: {self.lmdb_dir}", flush=True)
-        print(f"[DATASET] Windows: {self.length}", flush=True)
-        print(f"[DATASET] Metadata: input_dim={self.metadata['input_dim']}, "
-              f"target_shape={self.metadata['target_shape']}", flush=True)
+        print(f"[DATASET] {self.lmdb_dir}")
+        print(f"[DATASET] windows={self.length}")
+        print(
+            "[DATASET] "
+            f"input_dim={self.metadata['input_dim']} "
+            f"target_shape={self.metadata['target_shape']} "
+            f"target_mode={self.metadata.get('target_mode', 'angle')}"
+        )
 
     def _get_env(self):
         if self._env is None:
             self._env = lmdb.open(
-                self.lmdb_dir, readonly=True, lock=False, readahead=False,
-                meminit=False, max_readers=2048,
+                self.lmdb_dir,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_readers=2048,
             )
         return self._env
 
     @staticmethod
-    def _to_f32(v):
-        if isinstance(v, np.ndarray):
-            return torch.from_numpy(v.astype(np.float32))
-        return v.float()
+    def _to_f32(value) -> torch.Tensor:
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(value.astype(np.float32, copy=False))
+        return value.float()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int):
         with self._get_env().begin() as txn:
             value = txn.get(f"{idx:08d}".encode())
         if value is None:
@@ -102,73 +87,117 @@ class PreprocessedLMDBDataset(Dataset):
         y_vel = raw.get("y_vel")
         if y_vel is None:
             y_vel = np.zeros_like(raw["y"], dtype=np.float32)
-        return self._to_f32(raw["x"]), self._to_f32(raw["y"]), self._to_f32(y_vel)
+        valid_mask = raw.get("valid_mask")
+        if valid_mask is None:
+            valid_mask = np.ones((raw["y"].shape[0], 1), dtype=np.float32)
+        return (
+            self._to_f32(raw["x"]),
+            self._to_f32(raw["y"]),
+            self._to_f32(y_vel),
+            self._to_f32(valid_mask),
+        )
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
-
-def train_model(dataloader, epochs=50, sanity_check=False, device=None,
-                model_config=None, val_dataloader=None, checkpoint_dir=".",
-                velocity_loss_weight=0.0, acceleration_loss_weight=0.0,
-                velocity_target_loss_weight=0.0, log_every=100):
-    """Train or sanity-check the GestureTransformer."""
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[TRAIN] Device: {device}", flush=True)
-    if device.type == "cuda":
-        print(f"[TRAIN] GPU: {torch.cuda.get_device_name(0)}", flush=True)
-
-    if model_config is None:
-        model_config = {}
-    if velocity_target_loss_weight > 0 and any(
-        model_config.get(key) is None for key in ("nao_std", "nao_vel_mean", "nao_vel_std")
-    ):
+def validate_transformer_metadata(metadata: dict, source: str) -> None:
+    """Ensure the LMDB matches this energy-free transformer pipeline."""
+    gesture_energy_dim = int(metadata.get("gesture_energy_dim", 0) or 0)
+    if gesture_energy_dim != 0:
         raise ValueError(
-            "--velocity-target-loss-weight requires a freshly preprocessed LMDB "
-            "with nao_std, nao_vel_mean, and nao_vel_std metadata."
+            f"{source} has gesture_energy_dim={gesture_energy_dim}; "
+            "rerun machine_learning.transformers.preprocessing so transformer "
+            "training uses prosody + WavLM (+ optional text) only."
         )
-    model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
-    model.config = dict(model_config)
-    criterion = MotionLoss(
-        velocity_weight=velocity_loss_weight,
-        acceleration_weight=acceleration_loss_weight,
-        velocity_target_weight=velocity_target_loss_weight,
-        target_mode=model_config.get("target_mode", "angle"),
-        angle_std=model_config.get("nao_std"),
-        vel_mean=model_config.get("nao_vel_mean"),
-        vel_std=model_config.get("nao_vel_std"),
-    ).to(device)
-    lr = 1e-3 if sanity_check else 1e-4
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+    input_dim = int(metadata.get("input_dim", 0) or 0)
+    expected_input_dim = (
+        int(metadata.get("prosody_dim", 0) or 0)
+        + int(metadata.get("wavlm_dim", 0) or 0)
+        + int(metadata.get("text_dim", 0) or 0)
+    )
+    if input_dim <= 0 or input_dim != expected_input_dim:
+        raise ValueError(
+            f"{source} input_dim={input_dim} does not match "
+            f"prosody+wavlm+text dims ({expected_input_dim})"
+        )
+    target_shape = tuple(metadata.get("target_shape", ()))
+    if len(target_shape) != 1 or int(target_shape[0]) <= 0:
+        raise ValueError(f"{source} target_shape must be a 1-D NAO angle shape, got {target_shape}")
 
-    if sanity_check:
-        _sanity_check(model, criterion, optimizer, scaler, dataloader, device)
-    else:
-        _full_train(
-            model, criterion, optimizer, scaler, dataloader, epochs, device,
-            val_dataloader=val_dataloader,
-            checkpoint_dir=Path(checkpoint_dir),
-            log_every=log_every,
+
+def important_metadata(metadata: dict) -> dict:
+    keys = [
+        "fps",
+        "input_dim",
+        "target_shape",
+        "target_mode",
+        "target_representation",
+        "conditioning_parts",
+        "feature_names",
+        "target_names",
+        "prosody_dim",
+        "wavlm_dim",
+        "wavlm_model",
+        "text_dim",
+        "gesture_energy_dim",
+    ]
+    return {key: metadata.get(key) for key in keys}
+
+
+def validate_metadata_match(train_metadata: dict, val_metadata: dict) -> None:
+    train_contract = important_metadata(train_metadata)
+    val_contract = important_metadata(val_metadata)
+    if train_contract != val_contract:
+        raise ValueError(
+            "Validation LMDB metadata does not match training LMDB:\n"
+            f"train={train_contract}\nval={val_contract}"
         )
 
-    return model
+
+def build_model_config(metadata: dict, args: argparse.Namespace) -> dict:
+    return {
+        "input_dim": int(metadata["input_dim"]),
+        "hidden_dim": args.hidden_dim,
+        "num_heads": args.num_heads,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "target_shape": tuple(metadata["target_shape"]),
+        "target_mode": metadata.get("target_mode", "angle"),
+        "target_representation": metadata.get("target_representation", "nao_angles"),
+        "target_type": metadata.get("target_type", "nao_joint_angles"),
+        "nao_std": metadata.get("nao_std"),
+        "nao_vel_mean": metadata.get("nao_vel_mean"),
+        "nao_vel_std": metadata.get("nao_vel_std"),
+    }
+
+
+def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    if mask is None:
+        return torch.mean((pred - target) ** 2)
+    weight = mask
+    while weight.ndim < pred.ndim:
+        weight = weight.unsqueeze(-1)
+    per_frame_dims = math.prod(pred.shape[2:]) if pred.ndim > 2 else 1
+    denom = weight.sum().clamp(min=1.0) * per_frame_dims
+    return torch.sum((pred - target) ** 2 * weight) / denom
 
 
 class MotionLoss(nn.Module):
-    """Pose MSE plus optional velocity/acceleration MSE over the time axis."""
+    """Pose MSE plus optional temporal regularization losses."""
 
-    def __init__(self, velocity_weight=0.0, acceleration_weight=0.0,
-                 velocity_target_weight=0.0, target_mode="angle",
-                 angle_std=None, vel_mean=None, vel_std=None):
+    def __init__(
+        self,
+        velocity_weight: float = 0.0,
+        acceleration_weight: float = 0.0,
+        velocity_target_weight: float = 0.0,
+        target_mode: str = "angle",
+        angle_std=None,
+        vel_mean=None,
+        vel_std=None,
+    ):
         super().__init__()
         self.velocity_weight = float(velocity_weight)
         self.acceleration_weight = float(acceleration_weight)
         self.velocity_target_weight = float(velocity_target_weight)
         self.target_mode = target_mode
-        self.mse = nn.MSELoss()
         self.register_buffer(
             "angle_std",
             torch.as_tensor(angle_std if angle_std is not None else [1.0], dtype=torch.float32),
@@ -182,21 +211,42 @@ class MotionLoss(nn.Module):
             torch.as_tensor(vel_std if vel_std is not None else [1.0], dtype=torch.float32),
         )
 
-    def forward(self, pred, target, target_velocity=None):
-        pose_loss = self.mse(pred, target)
-        total = pose_loss
+    @staticmethod
+    def pair_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None or mask.shape[1] <= 1:
+            return None
+        return mask[:, 1:] * mask[:, :-1]
+
+    @staticmethod
+    def triplet_mask(mask: torch.Tensor | None) -> torch.Tensor | None:
+        if mask is None or mask.shape[1] <= 2:
+            return None
+        return mask[:, 2:] * mask[:, 1:-1] * mask[:, :-2]
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        target_velocity: torch.Tensor | None = None,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        total = masked_mse(pred, target, valid_mask)
 
         if self.velocity_weight > 0 and self.target_mode == "angle" and pred.shape[1] > 1:
             pred_vel = pred[:, 1:] - pred[:, :-1]
             target_vel = target[:, 1:] - target[:, :-1]
-            total = total + self.velocity_weight * self.mse(pred_vel, target_vel)
+            total = total + self.velocity_weight * masked_mse(
+                pred_vel, target_vel, self.pair_mask(valid_mask)
+            )
 
         if self.acceleration_weight > 0 and self.target_mode == "angle" and pred.shape[1] > 2:
             pred_vel = pred[:, 1:] - pred[:, :-1]
             target_vel = target[:, 1:] - target[:, :-1]
             pred_acc = pred_vel[:, 1:] - pred_vel[:, :-1]
             target_acc = target_vel[:, 1:] - target_vel[:, :-1]
-            total = total + self.acceleration_weight * self.mse(pred_acc, target_acc)
+            total = total + self.acceleration_weight * masked_mse(
+                pred_acc, target_acc, self.triplet_mask(valid_mask)
+            )
 
         if (
             self.velocity_target_weight > 0
@@ -210,267 +260,293 @@ class MotionLoss(nn.Module):
             vel_std = self.vel_std.view(shape)
             pred_delta = (pred[:, 1:] - pred[:, :-1]) * angle_std
             pred_velocity_norm = (pred_delta - vel_mean) / vel_std
-            total = total + self.velocity_target_weight * self.mse(
-                pred_velocity_norm, target_velocity[:, 1:]
+            total = total + self.velocity_target_weight * masked_mse(
+                pred_velocity_norm,
+                target_velocity[:, 1:],
+                valid_mask[:, 1:] if valid_mask is not None else None,
             )
 
         return total
 
 
-def _sanity_check(model, criterion, optimizer, scaler, dataloader, device):
-    """Overfit a single batch 500 times to verify the model can learn."""
-    print("\n[SANITY] Overfitting single batch × 500", flush=True)
-    batch_x, batch_y, batch_vel = unpack_batch(next(iter(dataloader)))
-    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-    if batch_vel is not None:
-        batch_vel = batch_vel.to(device)
-    print(f"[SANITY] X: {batch_x.shape}, Y: {batch_y.shape}", flush=True)
-
-    for i in range(500):
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            loss = criterion(model(batch_x), batch_y, batch_vel)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
-        if (i + 1) % 50 == 0 or i == 0:
-            print(f"[SANITY] {i + 1}/500  Loss: {loss.item():.8f}")
-
-    print("[SANITY] ✓ Complete\n")
+def autocast_context(device: torch.device):
+    return torch.amp.autocast("cuda", enabled=(device.type == "cuda"))
 
 
-def _evaluate(model, criterion, dataloader, device):
-    """Compute validation loss without gradient updates."""
-    if dataloader is None:
-        return None
+def make_grad_scaler(device: torch.device):
+    return torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    model.eval()
+
+def run_epoch(
+    model: nn.Module,
+    criterion: MotionLoss,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer=None,
+    scaler=None,
+    log_every: int = 50,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
     total_loss = 0.0
     total_batches = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            bx, by, bvel = unpack_batch(batch)
-            bx = bx.to(device, non_blocking=True)
-            by = by.to(device, non_blocking=True)
-            if bvel is not None:
-                bvel = bvel.to(device, non_blocking=True)
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                loss = criterion(model(bx), by, bvel)
-            total_loss += loss.item()
-            total_batches += 1
 
-    if total_batches == 0:
-        return None
-    return total_loss / total_batches
+    for batch_idx, (x, y, y_vel, valid_mask) in enumerate(loader, start=1):
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        y_vel = y_vel.to(device, non_blocking=True)
+        valid_mask = valid_mask.to(device, non_blocking=True)
 
-
-def _save_checkpoint(path, model, model_config, epoch, train_loss, val_loss=None):
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "model_config": model_config,
-        "epoch": epoch,
-        "train_loss": train_loss,
-        "val_loss": val_loss,
-    }
-    torch.save(checkpoint, path)
-
-
-def _full_train(model, criterion, optimizer, scaler, dataloader, epochs, device,
-                val_dataloader=None, checkpoint_dir=Path("."), log_every=100):
-    """Standard epoch-based training loop with AMP."""
-    print(f"\n[TRAIN] {epochs} epochs, {len(dataloader)} batches/epoch\n", flush=True)
-    if isinstance(criterion, MotionLoss):
-        print(
-            f"[LOSS] pose_mse + {criterion.velocity_weight:g}*velocity_mse "
-            f"+ {criterion.acceleration_weight:g}*acceleration_mse "
-            f"+ {criterion.velocity_target_weight:g}*target_velocity_mse\n",
-            flush=True,
-        )
-    if val_dataloader is not None:
-        print(f"[VAL] {len(val_dataloader)} validation batches/epoch\n", flush=True)
-
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_val_loss = float("inf")
-    best_train_loss = float("inf")
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-        t0 = time.time()
-        print(f"[TRAIN] Epoch {epoch+1}: loading first batch...", flush=True)
-
-        for batch_idx, batch in enumerate(dataloader):
-            bx, by, bvel = unpack_batch(batch)
-            if batch_idx == 0:
-                print(
-                    f"[TRAIN] Epoch {epoch+1}: first batch loaded "
-                    f"X={tuple(bx.shape)} Y={tuple(by.shape)}",
-                    flush=True,
-                )
-            bx = bx.to(device, non_blocking=True)
-            by = by.to(device, non_blocking=True)
-            if bvel is not None:
-                bvel = bvel.to(device, non_blocking=True)
-
+        if training:
             optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                loss = criterion(model(bx), by, bvel)
+
+        with torch.set_grad_enabled(training):
+            with autocast_context(device):
+                loss = criterion(model(x), y, y_vel, valid_mask)
+
+        if training:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            if batch_idx == 1 or batch_idx % log_every == 0:
+                print(f"  batch {batch_idx}/{len(loader)} loss={loss.item():.6f}", flush=True)
 
-            total_loss += loss.item()
-            if (batch_idx + 1) == 1 or (batch_idx + 1) % log_every == 0:
-                print(
-                    f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} "
-                    f"| Loss: {loss.item():.6f}",
-                    flush=True,
-                )
+        total_loss += loss.item()
+        total_batches += 1
 
-        avg = total_loss / len(dataloader)
-        val_loss = _evaluate(model, criterion, val_dataloader, device)
-        dt = time.time() - t0
-        if val_loss is None:
-            print(f"[TRAIN] Epoch {epoch+1}/{epochs} | Avg Loss: {avg:.6f} | {dt:.1f}s")
-        else:
-            print(
-                f"[TRAIN] Epoch {epoch+1}/{epochs} | "
-                f"Train Loss: {avg:.6f} | Val Loss: {val_loss:.6f} | {dt:.1f}s"
-            )
+    if total_batches == 0:
+        raise RuntimeError("DataLoader produced no batches")
+    return total_loss / total_batches
 
-        _save_checkpoint(
-            checkpoint_dir / "gesture_transformer_latest.pth",
-            model, getattr(model, "config", {}), epoch + 1, avg, val_loss,
-        )
 
-        is_best = False
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            is_best = True
-        elif val_loss is None and avg < best_train_loss:
-            best_train_loss = avg
-            is_best = True
-
-        if is_best:
-            _save_checkpoint(
-                checkpoint_dir / "gesture_transformer_best.pth",
-                model, getattr(model, "config", {}), epoch + 1, avg, val_loss,
-            )
-            metric_name = "val" if val_loss is not None else "train"
-            metric_value = val_loss if val_loss is not None else avg
-            print(f"[CHECKPOINT] ✓ New best {metric_name} loss: {metric_value:.6f}")
-
-    _save_checkpoint(
-        checkpoint_dir / "gesture_transformer_full_trained.pth",
-        model, getattr(model, "config", {}), epochs, avg, val_loss,
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    model_config: dict,
+    dataset_metadata: dict,
+    epoch: int,
+    train_loss: float,
+    val_loss: float | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": model_config,
+            "dataset_metadata": dataset_metadata,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+        },
+        path,
     )
-    print(f"[TRAIN] ✓ Saved checkpoints to {checkpoint_dir}")
+    print(f"[CHECKPOINT] {path}")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def sanity_check(
+    model: nn.Module,
+    criterion: MotionLoss,
+    loader: DataLoader,
+    device: torch.device,
+    steps: int,
+) -> None:
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = make_grad_scaler(device)
+    x, y, y_vel, valid_mask = next(iter(loader))
+    x = x.to(device)
+    y = y.to(device)
+    y_vel = y_vel.to(device)
+    valid_mask = valid_mask.to(device)
+    print(f"[SANITY] Overfitting one batch for {steps} steps")
+    print(f"[SANITY] x={tuple(x.shape)} y={tuple(y.shape)}")
+    for step in range(1, steps + 1):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device):
+            loss = criterion(model(x), y, y_vel, valid_mask)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        if step == 1 or step % 50 == 0 or step == steps:
+            print(f"[SANITY] {step}/{steps} loss={loss.item():.8f}")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train GestureTransformer")
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to .lmdb directory")
-    parser.add_argument("--val-data-dir", type=str, default=None,
-                        help="Optional path to validation .lmdb directory")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=2,
-                        help="DataLoader worker processes for LMDB reads")
-    parser.add_argument("--log-every", type=int, default=25,
-                        help="Print training progress every N batches")
-    parser.add_argument("--output-dir", type=str, default=".",
-                        help="Directory for latest/best/final checkpoints")
-    parser.add_argument("--sanity-check", action="store_true",
-                        help="Overfit single batch to verify model learns")
-    parser.add_argument("--velocity-loss-weight", type=float, default=0.0,
-                        help="Weight for frame-to-frame velocity MSE loss")
-    parser.add_argument("--acceleration-loss-weight", type=float, default=0.0,
-                        help="Weight for second-difference acceleration MSE loss")
-    parser.add_argument("--velocity-target-loss-weight", type=float, default=0.0,
-                        help="Weight for LMDB y_vel supervision in angle mode")
-    args = parser.parse_args()
 
-    dataset = PreprocessedLMDBDataset(args.data_dir)
-    model_config = {
-        "input_dim": int(dataset.metadata.get("input_dim", 1536)),
-        "target_shape": tuple(dataset.metadata.get("target_shape", [12, 3])),
-        "target_mode": dataset.metadata.get("target_mode", "angle"),
-        "target_type": dataset.metadata.get("target_type", "unknown"),
-        "nao_std": dataset.metadata.get("nao_std"),
-        "nao_vel_mean": dataset.metadata.get("nao_vel_mean"),
-        "nao_vel_std": dataset.metadata.get("nao_vel_std"),
-    }
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True,
+def train(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"[TRAIN] device={device}")
+    if device.type == "cuda":
+        print(f"[TRAIN] gpu={torch.cuda.get_device_name(0)}")
+
+    train_dataset = PreprocessedLMDBDataset(args.data_dir)
+    val_dataset = None
+    val_data_dir = args.val_data_dir
+    if val_data_dir is None:
+        candidate = Path(args.data_dir).parent / "val.lmdb"
+        if candidate.is_dir():
+            val_data_dir = str(candidate)
+    if val_data_dir and not args.sanity_check:
+        val_dataset = PreprocessedLMDBDataset(val_data_dir)
+        validate_metadata_match(train_dataset.metadata, val_dataset.metadata)
+
+    model_config = build_model_config(train_dataset.metadata, args)
+    if args.velocity_target_loss_weight > 0 and any(
+        model_config.get(key) is None for key in ("nao_std", "nao_vel_mean", "nao_vel_std")
+    ):
+        raise ValueError("--velocity-target-loss-weight requires nao_std/nao_vel stats in metadata")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
         persistent_workers=args.num_workers > 0,
     )
-    print(
-        f"[MAIN] {len(dataloader)} batches "
-        f"(batch_size={args.batch_size}, num_workers={args.num_workers})\n",
-        flush=True,
-    )
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=args.num_workers > 0,
+        )
 
-    val_dataloader = None
-    if not args.sanity_check:
-        val_data_dir = args.val_data_dir
-        if val_data_dir is None:
-            candidate = Path(args.data_dir).parent / "val.lmdb"
-            if candidate.is_dir():
-                val_data_dir = str(candidate)
-                print(f"[MAIN] Auto-detected validation LMDB: {val_data_dir}", flush=True)
-
-        if val_data_dir:
-            val_dataset = PreprocessedLMDBDataset(val_data_dir)
-            val_model_config = {
-                "input_dim": int(val_dataset.metadata.get("input_dim", 1536)),
-                "target_shape": tuple(val_dataset.metadata.get("target_shape", [12, 3])),
-                "target_mode": val_dataset.metadata.get("target_mode", "angle"),
-                "target_type": val_dataset.metadata.get("target_type", "unknown"),
-                "nao_std": val_dataset.metadata.get("nao_std"),
-                "nao_vel_mean": val_dataset.metadata.get("nao_vel_mean"),
-                "nao_vel_std": val_dataset.metadata.get("nao_vel_std"),
-            }
-            if val_model_config != model_config:
-                raise ValueError(
-                    f"Validation LMDB shape metadata does not match training LMDB: "
-                    f"{val_model_config} vs {model_config}"
-                )
-            val_dataloader = DataLoader(
-                val_dataset, batch_size=args.batch_size, shuffle=False,
-                num_workers=args.num_workers, pin_memory=True,
-                persistent_workers=args.num_workers > 0,
-            )
-            print(f"[MAIN] {len(val_dataloader)} validation batches\n", flush=True)
+    model = GestureTransformer(**model_init_kwargs(model_config)).to(device)
+    criterion = MotionLoss(
+        velocity_weight=args.velocity_loss_weight,
+        acceleration_weight=args.acceleration_loss_weight,
+        velocity_target_weight=args.velocity_target_loss_weight,
+        target_mode=model_config.get("target_mode", "angle"),
+        angle_std=model_config.get("nao_std"),
+        vel_mean=model_config.get("nao_vel_mean"),
+        vel_std=model_config.get("nao_vel_std"),
+    ).to(device)
 
     if args.sanity_check:
-        train_model(
-            dataloader,
-            sanity_check=True,
-            model_config=model_config,
-            velocity_loss_weight=args.velocity_loss_weight,
-            acceleration_loss_weight=args.acceleration_loss_weight,
-            velocity_target_loss_weight=args.velocity_target_loss_weight,
+        sanity_check(model, criterion, train_loader, device, args.sanity_steps)
+        return
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = make_grad_scaler(device)
+    output_dir = Path(args.output_dir)
+    best_metric = float("inf")
+    best_name = "val" if val_loader is not None else "train"
+
+    for epoch in range(1, args.epochs + 1):
+        start_time = time.time()
+        print(f"\n[TRAIN] epoch {epoch}/{args.epochs}")
+        train_loss = run_epoch(
+            model,
+            criterion,
+            train_loader,
+            device,
+            optimizer=optimizer,
+            scaler=scaler,
             log_every=args.log_every,
         )
-    else:
-        train_model(
-            dataloader,
-            epochs=args.epochs,
-            model_config=model_config,
-            val_dataloader=val_dataloader,
-            checkpoint_dir=args.output_dir,
-            velocity_loss_weight=args.velocity_loss_weight,
-            acceleration_loss_weight=args.acceleration_loss_weight,
-            velocity_target_loss_weight=args.velocity_target_loss_weight,
-            log_every=args.log_every,
+        val_loss = None
+        if val_loader is not None:
+            with torch.no_grad():
+                val_loss = run_epoch(model, criterion, val_loader, device)
+
+        elapsed = time.time() - start_time
+        if val_loss is None:
+            print(f"[TRAIN] epoch={epoch} train_loss={train_loss:.6f} time={elapsed:.1f}s")
+        else:
+            print(
+                f"[TRAIN] epoch={epoch} train_loss={train_loss:.6f} "
+                f"val_loss={val_loss:.6f} time={elapsed:.1f}s"
+            )
+
+        save_checkpoint(
+            output_dir / "gesture_transformer_latest.pth",
+            model,
+            model_config,
+            train_dataset.metadata,
+            epoch,
+            train_loss,
+            val_loss,
         )
+        metric = val_loss if val_loss is not None else train_loss
+        if metric < best_metric:
+            best_metric = metric
+            save_checkpoint(
+                output_dir / "gesture_transformer_best.pth",
+                model,
+                model_config,
+                train_dataset.metadata,
+                epoch,
+                train_loss,
+                val_loss,
+            )
+            print(f"[TRAIN] new best {best_name}_loss={best_metric:.6f}")
+
+    save_checkpoint(
+        output_dir / "gesture_transformer_full_trained.pth",
+        model,
+        model_config,
+        train_dataset.metadata,
+        args.epochs,
+        train_loss,
+        val_loss,
+    )
+    print(f"[TRAIN] complete: {output_dir}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train GestureTransformer on BEAT2 LMDB windows")
+    parser.add_argument("--data-dir", required=True, help="Path to train.lmdb")
+    parser.add_argument("--val-data-dir", default=None, help="Optional path to val.lmdb")
+    parser.add_argument("--output-dir", required=True, help="Directory for checkpoints")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--num-layers", type=int, default=4)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--velocity-loss-weight", type=float, default=0.0)
+    parser.add_argument("--acceleration-loss-weight", type=float, default=0.0)
+    parser.add_argument("--velocity-target-loss-weight", type=float, default=0.0)
+    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--sanity-check", action="store_true")
+    parser.add_argument("--sanity-steps", type=int, default=500)
+    parser.add_argument("--cpu", action="store_true")
+    args = parser.parse_args()
+
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers cannot be negative")
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive")
+    if args.hidden_dim <= 0:
+        raise ValueError("--hidden-dim must be positive")
+    if args.num_heads <= 0:
+        raise ValueError("--num-heads must be positive")
+    if args.hidden_dim % args.num_heads != 0:
+        raise ValueError("--hidden-dim must be divisible by --num-heads")
+    if args.num_layers <= 0:
+        raise ValueError("--num-layers must be positive")
+    if not 0 <= args.dropout < 1:
+        raise ValueError("--dropout must be in [0, 1)")
+    if args.log_every <= 0:
+        raise ValueError("--log-every must be positive")
+    if args.sanity_steps <= 0:
+        raise ValueError("--sanity-steps must be positive")
+
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
