@@ -136,6 +136,18 @@ def validate_args_and_data(args, dataset: PreprocessedGestureDataset, label: str
         )
 
 
+def validate_pose_target_metadata(metadata: dict, source: str) -> None:
+    """Diffusion is trained on normalized pose targets, never frame deltas."""
+    target_mode = metadata.get("target_mode", "angle")
+    target_type = str(metadata.get("target_type", ""))
+    if target_mode != "angle" or "delta" in target_type:
+        raise ValueError(
+            f"{source} uses target_mode={target_mode!r}, target_type={target_type!r}. "
+            "Conditional diffusion must train directly on normalized poses; "
+            "rerun machine_learning.diffusion.preprocessing without --target-mode delta."
+        )
+
+
 def masked_mse(values: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor | None) -> torch.Tensor:
     squared_error = torch.square(values - target)
     if valid_mask is None:
@@ -461,6 +473,7 @@ def train(args):
 
     train_dataset = PreprocessedGestureDataset(args.data_dir)
     validate_args_and_data(args, train_dataset, label="training")
+    validate_pose_target_metadata(train_dataset.metadata, str(args.data_dir))
     model_config = metadata_model_config(train_dataset.metadata, args)
     training_contract = metadata_training_contract(train_dataset.metadata)
     diffusion_config = {
@@ -487,6 +500,7 @@ def train(args):
     if val_data_dir and not args.sanity_check:
         val_dataset = PreprocessedGestureDataset(val_data_dir)
         validate_args_and_data(args, val_dataset, label="validation")
+        validate_pose_target_metadata(val_dataset.metadata, str(val_data_dir))
         val_contract = metadata_training_contract(val_dataset.metadata)
         if val_contract != training_contract:
             raise ValueError(
