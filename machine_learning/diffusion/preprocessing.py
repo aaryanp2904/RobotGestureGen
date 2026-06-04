@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from machine_learning.transformers import preprocessing as transformer_preprocessing
 
-DEFAULT_OUTPUT_DIR = "/vol/bitbucket/ap1922/BEAT2_NAO_Diffusion_Preprocessed"
+DEFAULT_OUTPUT_DIR = "/vol/bitbucket/ap1922/fyp_dataset/BEAT2_NAO_Diffusion_Preprocessed"
 
 preprocess = transformer_preprocessing.preprocess
 write_transformer_lmdb = transformer_preprocessing.write_transformer_lmdb
