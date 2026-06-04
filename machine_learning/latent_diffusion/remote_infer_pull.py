@@ -14,10 +14,15 @@ from pathlib import Path
 DEFAULT_REMOTE = "ap1922@gpu32.doc.ic.ac.uk"
 DEFAULT_JUMP_HOST = "shell1.doc.ic.ac.uk"
 DEFAULT_REMOTE_REPO = "/homes/ap1922/Documents/ForthYear/RobotGestureGen"
-DEFAULT_REMOTE_BEAT = "/vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0"
-DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/nao_predictions"
-DEFAULT_CHECKPOINT = "/data/ap1922/latent_diffusion_checkpoints_new/latent_diffusion_best.pth"
-DEFAULT_STATS = "/data/ap1922/Preprocessed_BEAT2_New/normalization_stats.json"
+DEFAULT_REMOTE_BEAT = "/data/ap1922/BEAT2/beat_english_v2.0.0"
+FYP_DATASET = "/vol/bitbucket/ap1922/fyp_dataset"
+DEFAULT_REMOTE_PRED_DIR = "/vol/bitbucket/ap1922/latent_diffusion_predictions"
+DEFAULT_CHECKPOINT = (
+    f"{FYP_DATASET}/BEAT2_NAO_Latent_Diffusion_Checkpoints/latent_diffusion_best.pth"
+)
+DEFAULT_STATS = (
+    "/data/ap1922/BEAT2_NAO_Latent_Diffusion_Preprocessed/normalization_stats.json"
+)
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -169,7 +174,7 @@ def main():
                         help="Disable latent low-energy rest blending remotely")
     parser.add_argument("--rest-blend", type=float, default=0.5,
                         help="Remote low-energy rest blend strength")
-    parser.add_argument("--local-dir", default="nao_predictions")
+    parser.add_argument("--local-dir", default="latent_diffusion_predictions")
     parser.add_argument("--remote-python", default="python")
     parser.add_argument("--remote-setup", default="")
     parser.add_argument("--server", default="http://localhost:8000")
