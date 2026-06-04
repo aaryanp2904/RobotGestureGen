@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate diffusion gesture predictions against ground-truth motion."""
+"""Evaluate latent-diffusion gesture predictions against ground-truth motion."""
 
 from __future__ import annotations
 
@@ -13,30 +13,40 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from machine_learning.transformers import plot_graphs as plots
+from machine_learning.diffusion import plot_graphs as diff_plots  # noqa: E402
+from machine_learning.transformers import plot_graphs as plots  # noqa: E402
 
-DATASET_ORDER = ["Ground Truth", "Diffusion"]
-COLORS = {"Ground Truth": "#2E86AB", "Diffusion": "#7B2CBF"}
+DATASET_ORDER = ["Ground Truth", "Latent Diffusion"]
+DATASET_KEYS = {"Ground Truth": "ground_truth", "Latent Diffusion": "latent_diffusion"}
+COLORS = {"Ground Truth": "#2E86AB", "Latent Diffusion": "#F77F00"}
+
+
+def use_latent_plot_labels() -> None:
+    plots.DATASET_ORDER = DATASET_ORDER
+    plots.DATASET_KEYS = DATASET_KEYS
+    plots.COLORS = COLORS
+    diff_plots.DATASET_ORDER = DATASET_ORDER
+    diff_plots.COLORS = COLORS
 
 
 def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, list[np.ndarray]]]:
     gt_dir = Path(args.ground_truth_dir)
-    diffusion_dir = Path(args.diffusion_dir)
+    latent_dir = Path(args.latent_diffusion_dir)
     gt_files = {path.name for path in gt_dir.glob(args.pattern)}
-    diffusion_files = {path.name for path in diffusion_dir.glob(args.pattern)}
-    filenames = sorted(gt_files & diffusion_files)
+    latent_files = {path.name for path in latent_dir.glob(args.pattern)}
+    filenames = sorted(gt_files & latent_files)
     if not filenames:
-        raise RuntimeError("No matching files found across ground-truth and diffusion folders.")
-    missing_diffusion = sorted(gt_files - diffusion_files)
-    if missing_diffusion:
-        print(f"[WARN] {len(missing_diffusion)} GT files missing from diffusion folder")
+        raise RuntimeError("No matching files found across ground-truth and latent-diffusion folders.")
+    missing_latent = sorted(gt_files - latent_files)
+    if missing_latent:
+        print(f"[WARN] {len(missing_latent)} GT files missing from latent-diffusion folder")
 
     data = {name: [] for name in DATASET_ORDER}
     names: list[str] | None = None
     for filename in filenames:
         loaded = {
             "Ground Truth": plots.load_gesture(gt_dir / filename),
-            "Diffusion": plots.load_gesture(diffusion_dir / filename),
+            "Latent Diffusion": plots.load_gesture(latent_dir / filename),
         }
         dims = {dataset: values.shape[1] for dataset, values in loaded.items()}
         if len(set(dims.values())) != 1:
@@ -55,41 +65,41 @@ def statistical_tests(metrics: dict[str, dict[str, np.ndarray]]) -> dict:
     results = {}
     for metric_name, by_dataset in metrics.items():
         gt = np.asarray(by_dataset["Ground Truth"], dtype=np.float64)
-        diffusion = np.asarray(by_dataset["Diffusion"], dtype=np.float64)
-        t_stat, t_p = plots.try_welch_t(gt, diffusion)
-        u_stat, u_p = plots.try_mann_whitney(gt, diffusion)
+        latent = np.asarray(by_dataset["Latent Diffusion"], dtype=np.float64)
+        t_stat, t_p = plots.try_welch_t(gt, latent)
+        u_stat, u_p = plots.try_mann_whitney(gt, latent)
         results[metric_name] = {
-            "ground_truth_vs_diffusion": {
+            "ground_truth_vs_latent_diffusion": {
                 "n_ground_truth": int(len(gt)),
-                "n_diffusion": int(len(diffusion)),
+                "n_latent_diffusion": int(len(latent)),
                 "ground_truth_mean": float(np.mean(gt)) if len(gt) else None,
-                "diffusion_mean": float(np.mean(diffusion)) if len(diffusion) else None,
+                "latent_diffusion_mean": float(np.mean(latent)) if len(latent) else None,
                 "ground_truth_median": float(np.median(gt)) if len(gt) else None,
-                "diffusion_median": float(np.median(diffusion)) if len(diffusion) else None,
+                "latent_diffusion_median": float(np.median(latent)) if len(latent) else None,
                 "welch_t_statistic": t_stat,
                 "welch_t_pvalue": t_p,
                 "mann_whitney_u_statistic": u_stat,
                 "mann_whitney_u_pvalue": u_p,
-                "cohens_d_gt_minus_diffusion": plots.cohens_d(gt, diffusion),
+                "cohens_d_gt_minus_latent_diffusion": plots.cohens_d(gt, latent),
             }
         }
     return results
 
 
 def print_summary_table(metrics: dict[str, dict[str, np.ndarray]], tests: dict) -> None:
-    print("\n[SUMMARY] Ground Truth vs Diffusion")
-    header = f"{'Metric':<32} {'GT mean':>12} {'Diffusion':>12} {'Welch p':>12} {'Cohen d':>10}"
+    print("\n[SUMMARY] Ground Truth vs Latent Diffusion")
+    header = f"{'Metric':<32} {'GT mean':>12} {'Latent':>12} {'Welch p':>12} {'Cohen d':>10}"
     print(header)
     print("-" * len(header))
     for metric_name, by_dataset in metrics.items():
         gt = np.mean(by_dataset["Ground Truth"])
-        diffusion = np.mean(by_dataset["Diffusion"])
-        row = tests[metric_name]["ground_truth_vs_diffusion"]
+        latent = np.mean(by_dataset["Latent Diffusion"])
+        row = tests[metric_name]["ground_truth_vs_latent_diffusion"]
         p_value = row.get("welch_t_pvalue")
         p_text = f"{p_value:.2e}" if p_value is not None else "n/a"
         print(
-            f"{metric_name:<32} {gt:12.4f} {diffusion:12.4f} "
-            f"{p_text:>12} {row['cohens_d_gt_minus_diffusion']:10.3f}"
+            f"{metric_name:<32} {gt:12.4f} {latent:12.4f} "
+            f"{p_text:>12} {row['cohens_d_gt_minus_latent_diffusion']:10.3f}"
         )
 
 
@@ -101,7 +111,7 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
     split = len(sampled["Ground Truth"])
     chunks = {
         "Ground Truth": projected[:split],
-        "Diffusion": projected[split:],
+        "Latent Diffusion": projected[split:],
     }
     plots.plt.figure(figsize=(9, 7))
     for dataset in DATASET_ORDER:
@@ -117,134 +127,15 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         )
     plots.plt.xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
     plots.plt.ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
-    plots.plt.title("PCA Motion Coverage: Ground Truth vs Diffusion")
+    plots.plt.title("PCA Motion Coverage: Ground Truth vs Latent Diffusion")
     plots.plt.legend(markerscale=2)
     plots.save_figure(output_dir, "10_pca_motion_coverage")
 
 
-def use_diffusion_plot_labels() -> None:
-    plots.DATASET_ORDER = DATASET_ORDER
-    plots.DATASET_KEYS = {"Ground Truth": "ground_truth", "Diffusion": "diffusion"}
-    plots.COLORS = COLORS
-
-
-def symlog_linthresh(values: dict[str, np.ndarray]) -> float:
-    arrays = [np.abs(np.asarray(value, dtype=np.float64)).reshape(-1) for value in values.values()]
-    arrays = [array[np.isfinite(array)] for array in arrays if array.size]
-    if not arrays:
-        return 1e-6
-    combined = np.concatenate(arrays)
-    positive = combined[combined > 0]
-    if not positive.size:
-        return 1e-6
-    # Keep small non-zero GT bars visible while still handling exact zeros.
-    return float(max(np.min(positive) / 10.0, np.max(positive) / 1e6, 1e-9))
-
-
-def apply_symlog_y(values: dict[str, np.ndarray], ylabel: str) -> None:
-    plots.plt.yscale("symlog", linthresh=symlog_linthresh(values), linscale=0.5)
-    plots.plt.ylabel(f"{ylabel} (symlog scale)")
-    plots.plt.grid(True, which="both", axis="y", alpha=0.25)
-
-
-def bar_with_error(
-    output_dir: Path,
-    stem: str,
-    title: str,
-    ylabel: str,
-    values: dict[str, np.ndarray],
-    sample_counts: dict[str, int],
-    symlog: bool = False,
-) -> None:
-    means = [float(np.mean(values[label])) for label in DATASET_ORDER]
-    sems = [
-        float(np.std(values[label], ddof=1) / np.sqrt(max(len(values[label]), 1)))
-        if len(values[label]) > 1
-        else 0.0
-        for label in DATASET_ORDER
-    ]
-    x = np.arange(len(DATASET_ORDER))
-    plots.plt.figure(figsize=(7, 6))
-    plots.plt.bar(
-        x,
-        means,
-        yerr=sems,
-        capsize=6,
-        color=[COLORS[label] for label in DATASET_ORDER],
-        edgecolor="black",
-        linewidth=0.7,
-    )
-    plots.plt.xticks(x, [f"{label}\n(n={sample_counts[label]})" for label in DATASET_ORDER])
-    if symlog:
-        apply_symlog_y(values, ylabel)
-    else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
-    plots.save_figure(output_dir, stem)
-
-
-def boxplot_metric(
-    output_dir: Path,
-    stem: str,
-    title: str,
-    ylabel: str,
-    values: dict[str, np.ndarray],
-    symlog: bool = False,
-) -> None:
-    plots.plt.figure(figsize=(7, 5))
-    box = plots.plt.boxplot(
-        [values[label] for label in DATASET_ORDER],
-        labels=DATASET_ORDER,
-        patch_artist=True,
-        showfliers=False,
-    )
-    for patch, label in zip(box["boxes"], DATASET_ORDER):
-        patch.set_facecolor(COLORS[label])
-        patch.set_alpha(0.65)
-    if symlog:
-        apply_symlog_y(values, ylabel)
-    else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
-    plots.save_figure(output_dir, stem)
-
-
-def grouped_joint_plot(
-    output_dir: Path,
-    stem: str,
-    title: str,
-    ylabel: str,
-    joint_names: list[str],
-    values: dict[str, np.ndarray],
-    symlog: bool = False,
-) -> None:
-    x = np.arange(len(joint_names))
-    width = 0.34
-    plots.plt.figure(figsize=(max(10, 0.55 * len(joint_names)), 6))
-    for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
-        plots.plt.bar(
-            x + offset,
-            values[dataset],
-            width,
-            label=dataset,
-            color=COLORS[dataset],
-            edgecolor="black",
-            linewidth=0.4,
-        )
-    plots.plt.xticks(x, joint_names, rotation=45, ha="right")
-    if symlog:
-        apply_symlog_y(values, ylabel)
-    else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
-    plots.plt.legend()
-    plots.save_figure(output_dir, stem)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate diffusion gestures against ground truth")
+    parser = argparse.ArgumentParser(description="Evaluate latent-diffusion gestures against ground truth")
     parser.add_argument("--ground-truth-dir", required=True)
-    parser.add_argument("--diffusion-dir", required=True)
+    parser.add_argument("--latent-diffusion-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--pattern", default="*.npy")
     parser.add_argument("--fps", type=int, default=30)
@@ -260,7 +151,7 @@ def main() -> None:
     if args.pairwise_resample_frames <= 1:
         raise ValueError("--pairwise-resample-frames must be greater than 1")
 
-    use_diffusion_plot_labels()
+    use_latent_plot_labels()
     plots.configure_style()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -332,16 +223,16 @@ def main() -> None:
             indent=2,
         )
 
-    bar_with_error(
+    diff_plots.bar_with_error(
         output_dir,
         "01_mean_motion_energy",
-        "Mean Motion Energy: Ground Truth vs Diffusion",
+        "Mean Motion Energy: Ground Truth vs Latent Diffusion",
         f"Motion energy ({plots.UNIT_ENERGY})",
         metrics_for_tests["motion_energy"],
         sample_counts,
         symlog=True,
     )
-    boxplot_metric(
+    diff_plots.boxplot_metric(
         output_dir,
         "02_motion_energy_boxplot",
         "Per-Sequence Motion Energy Distribution",
@@ -358,18 +249,18 @@ def main() -> None:
         dataset: np.mean(np.stack([item["mean_abs_velocity"] for item in per_joint[dataset]]), axis=0)
         for dataset in DATASET_ORDER
     }
-    grouped_joint_plot(
+    diff_plots.grouped_joint_plot(
         output_dir,
         "03_jointwise_range_comparison",
-        "Joint-Wise Range of Motion: Ground Truth vs Diffusion",
+        "Joint-Wise Range of Motion: Ground Truth vs Latent Diffusion",
         f"Range ({plots.UNIT_ANGLE})",
         joint_names,
         joint_mean_range,
     )
-    grouped_joint_plot(
+    diff_plots.grouped_joint_plot(
         output_dir,
         "04_jointwise_velocity_comparison",
-        "Joint-Wise Mean Absolute Velocity: Ground Truth vs Diffusion",
+        "Joint-Wise Mean Absolute Velocity: Ground Truth vs Latent Diffusion",
         f"Mean |velocity| ({plots.UNIT_VELOCITY})",
         joint_names,
         joint_mean_velocity,
@@ -391,7 +282,7 @@ def main() -> None:
         velocity_values,
     )
 
-    bar_with_error(
+    diff_plots.bar_with_error(
         output_dir,
         "07_trajectory_variance",
         "Average Trajectory Variance",
@@ -400,7 +291,7 @@ def main() -> None:
         sample_counts,
         symlog=True,
     )
-    bar_with_error(
+    diff_plots.bar_with_error(
         output_dir,
         "08_pairwise_sequence_distance",
         "Cross-Sequence Diversity (Pairwise Distance)",
@@ -409,7 +300,7 @@ def main() -> None:
         sample_counts,
         symlog=True,
     )
-    bar_with_error(
+    diff_plots.bar_with_error(
         output_dir,
         "09_distance_to_mean_pose",
         "Distance to Dataset Mean Pose (Mode Collapse Proof)",
@@ -434,7 +325,7 @@ def main() -> None:
         dataset: np.mean(np.stack([item["motion_energy"] for item in arm_per_joint[dataset]]), axis=0)
         for dataset in DATASET_ORDER
     }
-    grouped_joint_plot(
+    diff_plots.grouped_joint_plot(
         output_dir,
         "11_arm_range_of_motion",
         "Arm Joint Range of Motion",
@@ -442,7 +333,7 @@ def main() -> None:
         arm_joint_names,
         arm_range,
     )
-    grouped_joint_plot(
+    diff_plots.grouped_joint_plot(
         output_dir,
         "12_arm_joint_velocity",
         "Arm Joint Mean Absolute Velocity",
@@ -451,7 +342,7 @@ def main() -> None:
         arm_velocity,
         symlog=True,
     )
-    grouped_joint_plot(
+    diff_plots.grouped_joint_plot(
         output_dir,
         "13_arm_motion_energy",
         "Arm Joint Motion Energy",
@@ -490,9 +381,9 @@ def main() -> None:
             indent=2,
         )
 
-    print(f"\n[PLOTS] Wrote PNG and PDF figures to {output_dir}")
-    print(f"[PLOTS] Summary: {output_dir / 'evaluation_summary.json'}")
-    print(f"[PLOTS] Statistical tests: {output_dir / 'statistical_tests.json'}")
+    print(f"\n[PLOTS-LD] Wrote PNG and PDF figures to {output_dir}")
+    print(f"[PLOTS-LD] Summary: {output_dir / 'evaluation_summary.json'}")
+    print(f"[PLOTS-LD] Statistical tests: {output_dir / 'statistical_tests.json'}")
 
 
 if __name__ == "__main__":

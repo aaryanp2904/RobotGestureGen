@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""Create random BEAT2 gesture-question folders with four local model predictions."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import random
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from BEATArc.config import AUDIO_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
+from machine_learning.diffusion.remote_infer_pull import (  # noqa: E402
+    DEFAULT_CHECKPOINT as DIFFUSION_CHECKPOINT,
+    DEFAULT_STATS as DIFFUSION_STATS,
+)
+from machine_learning.latent_diffusion.remote_infer_pull import (  # noqa: E402
+    DEFAULT_CHECKPOINT as LATENT_DIFFUSION_CHECKPOINT,
+    DEFAULT_STATS as LATENT_DIFFUSION_STATS,
+)
+from machine_learning.transformers.remote_infer_pull import (  # noqa: E402
+    DEFAULT_CHECKPOINT as TRANSFORMER_CHECKPOINT,
+    DEFAULT_STATS as TRANSFORMER_STATS,
+)
+from machine_learning.transformers_delta.remote_infer_pull import (  # noqa: E402
+    DEFAULT_CHECKPOINT as TRANSFORMER_DELTA_CHECKPOINT,
+    DEFAULT_STATS as TRANSFORMER_DELTA_STATS,
+)
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    checkpoint_attr: str
+    stats_attr: str
+    sampler: str | None = None
+
+
+MODEL_SPECS = (
+    ModelSpec("diffusion", "diffusion_checkpoint", "diffusion_stats", sampler="ddpm"),
+    ModelSpec("latent_diffusion", "latent_diffusion_checkpoint", "latent_diffusion_stats", sampler="ddim"),
+    ModelSpec("transformers", "transformers_checkpoint", "transformers_stats"),
+    ModelSpec("transformers_delta", "transformers_delta_checkpoint", "transformers_delta_stats"),
+)
+
+
+def read_test_clip_ids(split_csv: Path, split: str) -> list[str]:
+    with open(split_csv, "r", newline="") as f:
+        rows = csv.DictReader(f)
+        clip_ids = [row["id"] for row in rows if row.get("type") == split and row.get("id")]
+    if not clip_ids:
+        raise RuntimeError(f"No {split!r} clips found in {split_csv}")
+    return clip_ids
+
+
+def choose_clip_ids(args: argparse.Namespace) -> list[str]:
+    if args.clip_id:
+        return list(dict.fromkeys(args.clip_id))
+
+    clip_ids = read_test_clip_ids(Path(args.split_csv), args.split)
+    if args.only_complete_assets:
+        clip_ids = [
+            clip_id
+            for clip_id in clip_ids
+            if (Path(args.audio_dir) / f"{clip_id}.wav").is_file()
+            and (Path(args.textgrid_dir) / f"{clip_id}.TextGrid").is_file()
+        ]
+    if len(clip_ids) < args.num_clips:
+        raise RuntimeError(f"Need {args.num_clips} clips, but only found {len(clip_ids)} eligible clips")
+
+    rng = random.Random(args.seed)
+    return rng.sample(clip_ids, args.num_clips)
+
+
+def copy_asset(src: Path, dst: Path, required: bool) -> None:
+    if src.is_file():
+        shutil.copy2(src, dst)
+        return
+    if required:
+        raise FileNotFoundError(f"Missing required asset: {src}")
+    print(f"[WARN] Missing asset, skipping: {src}")
+
+
+def build_common_args(args: argparse.Namespace, clip_id: str, output_path: Path) -> dict:
+    return {
+        "checkpoint": None,
+        "stats": None,
+        "output": str(output_path),
+        "wav": None,
+        "textgrid": None,
+        "clip_id": clip_id,
+        "audio_dir": args.audio_dir,
+        "textgrid_dir": args.textgrid_dir,
+        "fps": args.fps,
+        "window_size": args.window_size,
+        "stride": args.stride,
+        "seed": args.inference_seed,
+        "smooth_window": args.smooth_window,
+        "velocity_limit": args.velocity_limit,
+        "velocity_scale": args.velocity_scale,
+        "text_cpu": args.text_cpu,
+        "wavlm_cpu": args.wavlm_cpu,
+    }
+
+
+def run_model_inference(args: argparse.Namespace, spec: ModelSpec, clip_id: str, clip_dir: Path) -> None:
+    output_path = clip_dir / f"{spec.name}.npy"
+    infer_args = build_common_args(args, clip_id, output_path)
+    infer_args["checkpoint"] = getattr(args, spec.checkpoint_attr)
+    infer_args["stats"] = getattr(args, spec.stats_attr)
+
+    if spec.name == "diffusion":
+        from machine_learning.diffusion.inference import generate
+
+        infer_args.update(
+            {
+                "speaker_id": args.speaker_id,
+                "sampler": args.diffusion_sampler,
+                "sample_steps": args.sample_steps,
+                "guidance_scale": args.guidance_scale,
+                "diffusion_deterministic": args.diffusion_deterministic,
+                "diffusion_seed_frames": args.diffusion_seed_frames,
+            }
+        )
+    elif spec.name == "latent_diffusion":
+        from machine_learning.latent_diffusion.infer_nao import generate
+
+        infer_args.update(
+            {
+                "speaker_id": args.speaker_id,
+                "sampler": args.latent_sampler,
+                "sample_steps": args.sample_steps,
+                "guidance_scale": args.guidance_scale,
+                "diffusion_deterministic": args.diffusion_deterministic,
+                "diffusion_seed_frames": args.diffusion_seed_frames,
+                "energy_gate": args.energy_gate,
+                "rest_blend": args.rest_blend,
+            }
+        )
+    elif spec.name == "transformers":
+        from machine_learning.transformers.inference import generate
+    elif spec.name == "transformers_delta":
+        from machine_learning.transformers_delta.inference import generate
+    else:
+        raise ValueError(f"Unknown model spec: {spec.name}")
+
+    print(f"[INFER] {clip_id}: {spec.name}")
+    generate(argparse.Namespace(**infer_args))
+
+
+def scp_clip_folder(args: argparse.Namespace, clip_dir: Path) -> None:
+    if not args.scp_dest:
+        return
+    command = ["scp", "-r"]
+    if args.scp_jump_host:
+        command.extend(["-o", f"ProxyJump={args.scp_jump_host}"])
+    command.extend([str(clip_dir), args.scp_dest])
+    print("[CMD] " + " ".join(command))
+    if not args.dry_run:
+        subprocess.run(command, check=True)
+
+
+def write_manifest(args: argparse.Namespace, clip_ids: list[str], output_dir: Path) -> None:
+    manifest = {
+        "clip_ids": clip_ids,
+        "split_csv": str(args.split_csv),
+        "split": args.split,
+        "audio_dir": str(args.audio_dir),
+        "textgrid_dir": str(args.textgrid_dir),
+        "models": {
+            spec.name: {
+                "checkpoint": getattr(args, spec.checkpoint_attr),
+                "stats": getattr(args, spec.stats_attr),
+            }
+            for spec in MODEL_SPECS
+        },
+    }
+    with open(output_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def create_clip_folder(args: argparse.Namespace, clip_id: str, output_dir: Path) -> Path:
+    clip_dir = output_dir / clip_id
+    clip_dir.mkdir(parents=True, exist_ok=True)
+
+    copy_asset(Path(args.audio_dir) / f"{clip_id}.wav", clip_dir / f"{clip_id}.wav", required=True)
+    copy_asset(
+        Path(args.textgrid_dir) / f"{clip_id}.TextGrid",
+        clip_dir / f"{clip_id}.TextGrid",
+        required=not args.allow_missing_textgrid,
+    )
+
+    for spec in MODEL_SPECS:
+        run_model_inference(args, spec, clip_id, clip_dir)
+
+    scp_clip_folder(args, clip_dir)
+    return clip_dir
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Choose random BEAT2 test clips, run diffusion/latent-diffusion/"
+            "transformer/transformer-delta inference locally, and package one folder per clip."
+        )
+    )
+    parser.add_argument("--num-clips", type=int, default=10)
+    parser.add_argument("--clip-id", action="append", help="Explicit clip ID; repeat to bypass random sampling")
+    parser.add_argument("--split-csv", default=str(SPLIT_CSV))
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--audio-dir", default=str(AUDIO_DIR))
+    parser.add_argument("--textgrid-dir", default=str(TEXTGRID_DIR))
+    parser.add_argument("--output-dir", default="gesture_questions")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for clip selection")
+    parser.add_argument("--inference-seed", type=int, default=None, help="Seed passed to inference scripts")
+    parser.add_argument("--scp-dest", default=None, help="Optional destination, e.g. user@host:/path")
+    parser.add_argument("--scp-jump-host", default=None, help="Optional ProxyJump host for scp")
+    parser.add_argument(
+        "--allow-incomplete-assets",
+        dest="only_complete_assets",
+        action="store_false",
+        help="Allow randomly selected clips even if WAV/TextGrid files are missing",
+    )
+    parser.add_argument("--allow-missing-textgrid", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="Print selected clips without inference or scp")
+
+    parser.add_argument("--diffusion-checkpoint", default=DIFFUSION_CHECKPOINT)
+    parser.add_argument("--diffusion-stats", default=DIFFUSION_STATS)
+    parser.add_argument("--latent-diffusion-checkpoint", default=LATENT_DIFFUSION_CHECKPOINT)
+    parser.add_argument("--latent-diffusion-stats", default=LATENT_DIFFUSION_STATS)
+    parser.add_argument("--transformers-checkpoint", default=TRANSFORMER_CHECKPOINT)
+    parser.add_argument("--transformers-stats", default=TRANSFORMER_STATS)
+    parser.add_argument("--transformers-delta-checkpoint", default=TRANSFORMER_DELTA_CHECKPOINT)
+    parser.add_argument("--transformers-delta-stats", default=TRANSFORMER_DELTA_STATS)
+
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--window-size", type=float, default=2.0)
+    parser.add_argument("--stride", type=float, default=0.5)
+    parser.add_argument("--sample-steps", type=int, default=50)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--diffusion-sampler", choices=["ddpm", "ddim"], default="ddpm")
+    parser.add_argument("--latent-sampler", choices=["ddpm", "ddim"], default="ddim")
+    parser.add_argument("--diffusion-deterministic", action="store_true")
+    parser.add_argument("--diffusion-seed-frames", type=int, default=None)
+    parser.add_argument("--speaker-id", default=None)
+    parser.add_argument("--smooth-window", type=int, default=1)
+    parser.add_argument("--velocity-limit", action="store_true")
+    parser.add_argument("--velocity-scale", type=float, default=1.0)
+    parser.add_argument("--disable-energy-gate", dest="energy_gate", action="store_false", default=True)
+    parser.add_argument("--rest-blend", type=float, default=0.5)
+    parser.add_argument("--text-cpu", action="store_true")
+    parser.add_argument("--wavlm-cpu", action="store_true")
+    parser.add_argument("--continue-on-error", action="store_true")
+    parser.set_defaults(only_complete_assets=True)
+    return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.num_clips <= 0:
+        raise ValueError("--num-clips must be positive")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
+    if args.window_size <= 0 or args.stride <= 0:
+        raise ValueError("--window-size and --stride must be positive")
+    if args.sample_steps <= 0:
+        raise ValueError("--sample-steps must be positive")
+    if args.guidance_scale < 0:
+        raise ValueError("--guidance-scale cannot be negative")
+    if args.diffusion_seed_frames is not None and args.diffusion_seed_frames < 0:
+        raise ValueError("--diffusion-seed-frames cannot be negative")
+    if args.smooth_window < 1:
+        raise ValueError("--smooth-window must be at least 1")
+    if args.velocity_scale <= 0:
+        raise ValueError("--velocity-scale must be positive")
+    if not 0.0 <= args.rest_blend <= 1.0:
+        raise ValueError("--rest-blend must be in [0, 1]")
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    output_dir = Path(args.output_dir)
+    clip_ids = choose_clip_ids(args)
+    if args.dry_run:
+        print("[DRY-RUN] Selected clips:")
+        for clip_id in clip_ids:
+            print(f"  {clip_id}")
+        print(f"[DRY-RUN] Output directory would be: {output_dir.resolve()}")
+        if args.scp_dest:
+            print(f"[DRY-RUN] Each clip folder would be copied to: {args.scp_dest}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_manifest(args, clip_ids, output_dir)
+
+    print(f"[SETUP] Selected {len(clip_ids)} clips")
+    print(f"[SETUP] Output directory: {output_dir.resolve()}")
+    failures = []
+    for idx, clip_id in enumerate(clip_ids, start=1):
+        print("\n" + "=" * 80)
+        print(f"[CLIP] {idx}/{len(clip_ids)} {clip_id}")
+        print("=" * 80)
+        try:
+            clip_dir = create_clip_folder(args, clip_id, output_dir)
+            print(f"[DONE] {clip_id}: {clip_dir.resolve()}")
+        except Exception as exc:
+            if not args.continue_on_error:
+                raise
+            print(f"[WARN] Failed {clip_id}: {exc}")
+            failures.append({"clip_id": clip_id, "error": str(exc)})
+
+    if failures:
+        failure_path = output_dir / "failed_gesture_questions.json"
+        with open(failure_path, "w") as f:
+            json.dump(failures, f, indent=2)
+        print(f"[DONE] Completed with {len(failures)} failures: {failure_path}")
+    else:
+        print("[DONE] Completed without failures")
+
+
+if __name__ == "__main__":
+    main()

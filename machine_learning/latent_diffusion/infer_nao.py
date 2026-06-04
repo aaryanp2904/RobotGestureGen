@@ -275,6 +275,10 @@ def main():
     parser.add_argument("--wavlm-cpu", action="store_true")
     args = parser.parse_args()
 
+    generate(args)
+
+
+def generate(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.seed is not None:
         torch.manual_seed(args.seed)
