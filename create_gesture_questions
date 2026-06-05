@@ -1,28 +1,42 @@
 #!/usr/bin/env python3
-"""Create random BEAT2 gesture-question folders with four local model predictions."""
+"""Create BEAT2 gesture-question folders with four model predictions.
+
+Default mode (run from your laptop):
+  1. One SSH session on the remote GPU machine (sync script + run all inference).
+  2. One recursive scp that pulls the full output directory back locally.
+
+Use --worker only when invoked on the remote machine itself.
+"""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.config import AUDIO_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
 from machine_learning.diffusion.remote_infer_pull import (  # noqa: E402
     DEFAULT_CHECKPOINT as DIFFUSION_CHECKPOINT,
+    DEFAULT_JUMP_HOST,
+    DEFAULT_REMOTE,
+    DEFAULT_REMOTE_BEAT,
+    DEFAULT_REMOTE_REPO,
     DEFAULT_STATS as DIFFUSION_STATS,
 )
 from machine_learning.latent_diffusion.remote_infer_pull import (  # noqa: E402
     DEFAULT_CHECKPOINT as LATENT_DIFFUSION_CHECKPOINT,
+    DEFAULT_REMOTE_PYTHON,
     DEFAULT_STATS as LATENT_DIFFUSION_STATS,
 )
 from machine_learning.transformers.remote_infer_pull import (  # noqa: E402
@@ -34,21 +48,135 @@ from machine_learning.transformers_delta.remote_infer_pull import (  # noqa: E40
     DEFAULT_STATS as TRANSFORMER_DELTA_STATS,
 )
 
+DEFAULT_REMOTE_OUTPUT_ROOT = "/vol/bitbucket/ap1922/gesture_questions_runs"
+DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
+DEFAULT_SSH_CONTROL_PERSIST = "10m"
+
 
 @dataclass(frozen=True)
 class ModelSpec:
     name: str
     checkpoint_attr: str
     stats_attr: str
+    module: str
     sampler: str | None = None
 
 
 MODEL_SPECS = (
-    ModelSpec("diffusion", "diffusion_checkpoint", "diffusion_stats", sampler="ddpm"),
-    ModelSpec("latent_diffusion", "latent_diffusion_checkpoint", "latent_diffusion_stats", sampler="ddim"),
-    ModelSpec("transformers", "transformers_checkpoint", "transformers_stats"),
-    ModelSpec("transformers_delta", "transformers_delta_checkpoint", "transformers_delta_stats"),
+    ModelSpec(
+        "diffusion",
+        "diffusion_checkpoint",
+        "diffusion_stats",
+        "machine_learning.diffusion.inference",
+        sampler="ddpm",
+    ),
+    ModelSpec(
+        "latent_diffusion",
+        "latent_diffusion_checkpoint",
+        "latent_diffusion_stats",
+        "machine_learning.latent_diffusion.infer_nao",
+        sampler="ddim",
+    ),
+    ModelSpec(
+        "transformers",
+        "transformers_checkpoint",
+        "transformers_stats",
+        "machine_learning.transformers.inference",
+    ),
+    ModelSpec(
+        "transformers_delta",
+        "transformers_delta_checkpoint",
+        "transformers_delta_stats",
+        "machine_learning.transformers_delta.inference",
+    ),
 )
+
+
+def run_command(command: list[str], dry_run: bool = False) -> None:
+    printable = " ".join(shlex.quote(part) for part in command)
+    print(f"[CMD] {printable}")
+    if not dry_run:
+        subprocess.run(command, check=True)
+
+
+def remote_quote(value: str) -> str:
+    return shlex.quote(value)
+
+
+def ssh_reuse_options(args: argparse.Namespace) -> list[str]:
+    if args.no_ssh_reuse or os.name == "nt":
+        return []
+    return [
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPersist={args.ssh_control_persist}",
+        "-o",
+        f"ControlPath={args.ssh_control_path}",
+    ]
+
+
+def ensure_ssh_control_dir(args: argparse.Namespace) -> None:
+    if args.no_ssh_reuse or args.dry_run:
+        return
+    Path(args.ssh_control_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+def ssh_command(args: argparse.Namespace, remote_command: str) -> list[str]:
+    command = ["ssh"]
+    command.extend(ssh_reuse_options(args))
+    if args.jump_host:
+        command.extend(["-J", args.jump_host])
+    command.extend([args.remote, remote_command])
+    return command
+
+
+def pull_all_folders_via_scp(args: argparse.Namespace, local_dir: Path) -> None:
+    """Pull every clip folder in a single recursive scp transfer."""
+    local_dir.mkdir(parents=True, exist_ok=True)
+    remote_spec = f"{args.remote}:{args.remote_output_dir}/"
+    command = ["scp", "-r"]
+    command.extend(ssh_reuse_options(args))
+    if args.jump_host:
+        command.extend(["-o", f"ProxyJump={args.jump_host}"])
+    command.extend([remote_spec, str(local_dir)])
+    print("[LOCAL] Pulling all clip folders in one scp transfer")
+    run_command(command, dry_run=args.dry_run)
+
+
+def run_remote_worker_session(args: argparse.Namespace) -> None:
+    """Sync the worker script and run inference in a single SSH session."""
+    remote_script = f"{args.remote_repo}/create_gesture_questions"
+    parts = []
+    if not args.no_sync_script:
+        parts.append(f"cat > {remote_quote(remote_script)}")
+        parts.append(f"chmod +x {remote_quote(remote_script)}")
+    parts.append(build_remote_worker_command(args))
+    remote_shell = " && ".join(parts)
+    command = ssh_command(args, remote_shell)
+
+    if args.dry_run:
+        print("[DRY-RUN] Single SSH session (sync script + worker):")
+        print(" ".join(shlex.quote(part) for part in command))
+        if not args.no_sync_script:
+            print(f"[DRY-RUN] Script stdin: {REPO_ROOT / 'create_gesture_questions'}")
+        return
+
+    stdin = None
+    if not args.no_sync_script:
+        stdin = open(REPO_ROOT / "create_gesture_questions", "rb")
+    try:
+        print("[REMOTE] Single SSH session: sync script + run worker")
+        subprocess.run(command, stdin=stdin, check=True)
+    finally:
+        if stdin is not None:
+            stdin.close()
+
+
+def cleanup_remote_output(args: argparse.Namespace) -> None:
+    cleanup_command = f"rm -rf {remote_quote(args.remote_output_dir)}"
+    print(f"[REMOTE] Cleaning up: {args.remote_output_dir}")
+    run_command(ssh_command(args, cleanup_command), dry_run=args.dry_run)
 
 
 def read_test_clip_ids(split_csv: Path, split: str) -> list[str]:
@@ -142,6 +270,7 @@ def run_model_inference(args: argparse.Namespace, spec: ModelSpec, clip_id: str,
                 "diffusion_seed_frames": args.diffusion_seed_frames,
                 "energy_gate": args.energy_gate,
                 "rest_blend": args.rest_blend,
+                "smooth_window": args.latent_smooth_window,
             }
         )
     elif spec.name == "transformers":
@@ -153,18 +282,6 @@ def run_model_inference(args: argparse.Namespace, spec: ModelSpec, clip_id: str,
 
     print(f"[INFER] {clip_id}: {spec.name}")
     generate(argparse.Namespace(**infer_args))
-
-
-def scp_clip_folder(args: argparse.Namespace, clip_dir: Path) -> None:
-    if not args.scp_dest:
-        return
-    command = ["scp", "-r"]
-    if args.scp_jump_host:
-        command.extend(["-o", f"ProxyJump={args.scp_jump_host}"])
-    command.extend([str(clip_dir), args.scp_dest])
-    print("[CMD] " + " ".join(command))
-    if not args.dry_run:
-        subprocess.run(command, check=True)
 
 
 def write_manifest(args: argparse.Namespace, clip_ids: list[str], output_dir: Path) -> None:
@@ -200,102 +317,17 @@ def create_clip_folder(args: argparse.Namespace, clip_id: str, output_dir: Path)
     for spec in MODEL_SPECS:
         run_model_inference(args, spec, clip_id, clip_dir)
 
-    scp_clip_folder(args, clip_dir)
     return clip_dir
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Choose random BEAT2 test clips, run diffusion/latent-diffusion/"
-            "transformer/transformer-delta inference locally, and package one folder per clip."
-        )
-    )
-    parser.add_argument("--num-clips", type=int, default=10)
-    parser.add_argument("--clip-id", action="append", help="Explicit clip ID; repeat to bypass random sampling")
-    parser.add_argument("--split-csv", default=str(SPLIT_CSV))
-    parser.add_argument("--split", default="test")
-    parser.add_argument("--audio-dir", default=str(AUDIO_DIR))
-    parser.add_argument("--textgrid-dir", default=str(TEXTGRID_DIR))
-    parser.add_argument("--output-dir", default="gesture_questions")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for clip selection")
-    parser.add_argument("--inference-seed", type=int, default=None, help="Seed passed to inference scripts")
-    parser.add_argument("--scp-dest", default=None, help="Optional destination, e.g. user@host:/path")
-    parser.add_argument("--scp-jump-host", default=None, help="Optional ProxyJump host for scp")
-    parser.add_argument(
-        "--allow-incomplete-assets",
-        dest="only_complete_assets",
-        action="store_false",
-        help="Allow randomly selected clips even if WAV/TextGrid files are missing",
-    )
-    parser.add_argument("--allow-missing-textgrid", action="store_true")
-    parser.add_argument("--dry-run", action="store_true", help="Print selected clips without inference or scp")
-
-    parser.add_argument("--diffusion-checkpoint", default=DIFFUSION_CHECKPOINT)
-    parser.add_argument("--diffusion-stats", default=DIFFUSION_STATS)
-    parser.add_argument("--latent-diffusion-checkpoint", default=LATENT_DIFFUSION_CHECKPOINT)
-    parser.add_argument("--latent-diffusion-stats", default=LATENT_DIFFUSION_STATS)
-    parser.add_argument("--transformers-checkpoint", default=TRANSFORMER_CHECKPOINT)
-    parser.add_argument("--transformers-stats", default=TRANSFORMER_STATS)
-    parser.add_argument("--transformers-delta-checkpoint", default=TRANSFORMER_DELTA_CHECKPOINT)
-    parser.add_argument("--transformers-delta-stats", default=TRANSFORMER_DELTA_STATS)
-
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--window-size", type=float, default=2.0)
-    parser.add_argument("--stride", type=float, default=0.5)
-    parser.add_argument("--sample-steps", type=int, default=50)
-    parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--diffusion-sampler", choices=["ddpm", "ddim"], default="ddpm")
-    parser.add_argument("--latent-sampler", choices=["ddpm", "ddim"], default="ddim")
-    parser.add_argument("--diffusion-deterministic", action="store_true")
-    parser.add_argument("--diffusion-seed-frames", type=int, default=None)
-    parser.add_argument("--speaker-id", default=None)
-    parser.add_argument("--smooth-window", type=int, default=1)
-    parser.add_argument("--velocity-limit", action="store_true")
-    parser.add_argument("--velocity-scale", type=float, default=1.0)
-    parser.add_argument("--disable-energy-gate", dest="energy_gate", action="store_false", default=True)
-    parser.add_argument("--rest-blend", type=float, default=0.5)
-    parser.add_argument("--text-cpu", action="store_true")
-    parser.add_argument("--wavlm-cpu", action="store_true")
-    parser.add_argument("--continue-on-error", action="store_true")
-    parser.set_defaults(only_complete_assets=True)
-    return parser.parse_args()
-
-
-def validate_args(args: argparse.Namespace) -> None:
-    if args.num_clips <= 0:
-        raise ValueError("--num-clips must be positive")
-    if args.fps <= 0:
-        raise ValueError("--fps must be positive")
-    if args.window_size <= 0 or args.stride <= 0:
-        raise ValueError("--window-size and --stride must be positive")
-    if args.sample_steps <= 0:
-        raise ValueError("--sample-steps must be positive")
-    if args.guidance_scale < 0:
-        raise ValueError("--guidance-scale cannot be negative")
-    if args.diffusion_seed_frames is not None and args.diffusion_seed_frames < 0:
-        raise ValueError("--diffusion-seed-frames cannot be negative")
-    if args.smooth_window < 1:
-        raise ValueError("--smooth-window must be at least 1")
-    if args.velocity_scale <= 0:
-        raise ValueError("--velocity-scale must be positive")
-    if not 0.0 <= args.rest_blend <= 1.0:
-        raise ValueError("--rest-blend must be in [0, 1]")
-
-
-def main() -> None:
-    args = parse_args()
-    validate_args(args)
-
+def worker_main(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     clip_ids = choose_clip_ids(args)
     if args.dry_run:
-        print("[DRY-RUN] Selected clips:")
+        print("[DRY-RUN] Worker would process:")
         for clip_id in clip_ids:
             print(f"  {clip_id}")
-        print(f"[DRY-RUN] Output directory would be: {output_dir.resolve()}")
-        if args.scp_dest:
-            print(f"[DRY-RUN] Each clip folder would be copied to: {args.scp_dest}")
+        print(f"[DRY-RUN] Remote output directory would be: {output_dir.resolve()}")
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -326,5 +358,277 @@ def main() -> None:
         print("[DONE] Completed without failures")
 
 
+def build_worker_argv(args: argparse.Namespace) -> list[str]:
+    argv = [
+        "--worker",
+        "--output-dir",
+        args.remote_output_dir,
+        "--split-csv",
+        args.split_csv,
+        "--split",
+        args.split,
+        "--audio-dir",
+        args.audio_dir,
+        "--textgrid-dir",
+        args.textgrid_dir,
+        "--num-clips",
+        str(args.num_clips),
+        "--diffusion-checkpoint",
+        args.diffusion_checkpoint,
+        "--diffusion-stats",
+        args.diffusion_stats,
+        "--latent-diffusion-checkpoint",
+        args.latent_diffusion_checkpoint,
+        "--latent-diffusion-stats",
+        args.latent_diffusion_stats,
+        "--transformers-checkpoint",
+        args.transformers_checkpoint,
+        "--transformers-stats",
+        args.transformers_stats,
+        "--transformers-delta-checkpoint",
+        args.transformers_delta_checkpoint,
+        "--transformers-delta-stats",
+        args.transformers_delta_stats,
+        "--fps",
+        str(args.fps),
+        "--window-size",
+        str(args.window_size),
+        "--stride",
+        str(args.stride),
+        "--sample-steps",
+        str(args.sample_steps),
+        "--guidance-scale",
+        str(args.guidance_scale),
+        "--diffusion-sampler",
+        args.diffusion_sampler,
+        "--latent-sampler",
+        args.latent_sampler,
+        "--smooth-window",
+        str(args.smooth_window),
+        "--latent-smooth-window",
+        str(args.latent_smooth_window),
+        "--velocity-scale",
+        str(args.velocity_scale),
+        "--rest-blend",
+        str(args.rest_blend),
+    ]
+    if args.seed is not None:
+        argv.extend(["--seed", str(args.seed)])
+    if args.inference_seed is not None:
+        argv.extend(["--inference-seed", str(args.inference_seed)])
+    if args.speaker_id is not None:
+        argv.extend(["--speaker-id", args.speaker_id])
+    if args.diffusion_deterministic:
+        argv.append("--diffusion-deterministic")
+    if args.diffusion_seed_frames is not None:
+        argv.extend(["--diffusion-seed-frames", str(args.diffusion_seed_frames)])
+    if args.velocity_limit:
+        argv.append("--velocity-limit")
+    if not args.energy_gate:
+        argv.append("--disable-energy-gate")
+    if args.text_cpu:
+        argv.append("--text-cpu")
+    if args.wavlm_cpu:
+        argv.append("--wavlm-cpu")
+    if args.continue_on_error:
+        argv.append("--continue-on-error")
+    if args.allow_missing_textgrid:
+        argv.append("--allow-missing-textgrid")
+    if not args.only_complete_assets:
+        argv.append("--allow-incomplete-assets")
+    for clip_id in args.clip_id or []:
+        argv.extend(["--clip-id", clip_id])
+    return argv
+
+
+def build_remote_worker_command(args: argparse.Namespace) -> str:
+    setup = f"{args.remote_setup} && " if args.remote_setup else ""
+    worker_script = f"{args.remote_repo}/create_gesture_questions"
+    worker_argv = " ".join(shlex.quote(part) for part in build_worker_argv(args))
+    return (
+        f"cd {remote_quote(args.remote_repo)} && "
+        f"{setup}"
+        f"mkdir -p {remote_quote(args.remote_output_dir)} && "
+        f"{remote_quote(args.remote_python)} {remote_quote(worker_script)} {worker_argv}"
+    )
+
+
+def apply_remote_defaults(args: argparse.Namespace) -> None:
+    beat_root = Path(args.remote_beat_root)
+    args.split_csv = str(beat_root / "train_test_split.csv")
+    args.audio_dir = str(beat_root / "wave16k")
+    args.textgrid_dir = str(beat_root / "textgrid")
+    if args.remote_output_dir is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.remote_output_dir = f"{DEFAULT_REMOTE_OUTPUT_ROOT}/{stamp}"
+
+
+def orchestrator_main(args: argparse.Namespace) -> None:
+    apply_remote_defaults(args)
+    local_dir = Path(args.output_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.dry_run:
+        run_remote_worker_session(args)
+        print(
+            f"[DRY-RUN] Single scp pull: "
+            f"{args.remote}:{args.remote_output_dir}/ -> {local_dir.resolve()}"
+        )
+        if not args.keep_remote_output:
+            print(f"[DRY-RUN] Would remove remote output: {args.remote_output_dir}")
+        return
+
+    ensure_ssh_control_dir(args)
+    print(f"[REMOTE] Running worker on {args.remote}")
+    print(f"[REMOTE] Output directory: {args.remote_output_dir}")
+    run_remote_worker_session(args)
+
+    print(f"\n[LOCAL] Destination: {local_dir.resolve()}")
+    pull_all_folders_via_scp(args, local_dir)
+
+    if not args.keep_remote_output:
+        cleanup_remote_output(args)
+
+    print(f"\n[DONE] Gesture question folders copied to: {local_dir.resolve()}")
+
+
+def add_shared_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--num-clips", type=int, default=10)
+    parser.add_argument("--clip-id", action="append", help="Explicit clip ID; repeat to bypass random sampling")
+    parser.add_argument("--split-csv")
+    parser.add_argument("--split", default="test")
+    parser.add_argument("--audio-dir")
+    parser.add_argument("--textgrid-dir")
+    parser.add_argument("--output-dir", default="gesture_questions")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for clip selection")
+    parser.add_argument("--inference-seed", type=int, default=None, help="Seed passed to inference scripts")
+    parser.add_argument(
+        "--allow-incomplete-assets",
+        dest="only_complete_assets",
+        action="store_false",
+        help="Allow randomly selected clips even if WAV/TextGrid files are missing",
+    )
+    parser.add_argument("--allow-missing-textgrid", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+
+    parser.add_argument("--diffusion-checkpoint", default=DIFFUSION_CHECKPOINT)
+    parser.add_argument("--diffusion-stats", default=DIFFUSION_STATS)
+    parser.add_argument("--latent-diffusion-checkpoint", default=LATENT_DIFFUSION_CHECKPOINT)
+    parser.add_argument("--latent-diffusion-stats", default=LATENT_DIFFUSION_STATS)
+    parser.add_argument("--transformers-checkpoint", default=TRANSFORMER_CHECKPOINT)
+    parser.add_argument("--transformers-stats", default=TRANSFORMER_STATS)
+    parser.add_argument("--transformers-delta-checkpoint", default=TRANSFORMER_DELTA_CHECKPOINT)
+    parser.add_argument("--transformers-delta-stats", default=TRANSFORMER_DELTA_STATS)
+
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--window-size", type=float, default=2.0)
+    parser.add_argument("--stride", type=float, default=0.5)
+    parser.add_argument("--sample-steps", type=int, default=50)
+    parser.add_argument("--guidance-scale", type=float, default=1.0)
+    parser.add_argument("--diffusion-sampler", choices=["ddpm", "ddim"], default="ddpm")
+    parser.add_argument("--latent-sampler", choices=["ddpm", "ddim"], default="ddim")
+    parser.add_argument("--diffusion-deterministic", action="store_true")
+    parser.add_argument("--diffusion-seed-frames", type=int, default=None)
+    parser.add_argument("--speaker-id", default=None)
+    parser.add_argument("--smooth-window", type=int, default=1)
+    parser.add_argument("--latent-smooth-window", type=int, default=7)
+    parser.add_argument("--velocity-limit", action="store_true")
+    parser.add_argument("--velocity-scale", type=float, default=1.0)
+    parser.add_argument("--disable-energy-gate", dest="energy_gate", action="store_false", default=True)
+    parser.add_argument("--rest-blend", type=float, default=0.7)
+    parser.add_argument("--text-cpu", action="store_true")
+    parser.add_argument("--wavlm-cpu", action="store_true")
+    parser.add_argument("--continue-on-error", action="store_true")
+    parser.set_defaults(only_complete_assets=True)
+
+
+def add_orchestrator_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--remote", default=DEFAULT_REMOTE)
+    parser.add_argument("--jump-host", default=DEFAULT_JUMP_HOST)
+    parser.add_argument("--remote-repo", default=DEFAULT_REMOTE_REPO)
+    parser.add_argument("--remote-beat-root", default=DEFAULT_REMOTE_BEAT)
+    parser.add_argument("--remote-output-dir", default=None, help="Remote staging directory before scp pull")
+    parser.add_argument("--remote-python", default=DEFAULT_REMOTE_PYTHON)
+    parser.add_argument("--remote-setup", default="", help="Shell snippet to run before remote worker")
+    parser.add_argument("--keep-remote-output", action="store_true", help="Do not delete remote staging directory")
+    parser.add_argument(
+        "--no-sync-script",
+        action="store_true",
+        help="Use the create_gesture_questions already present on the remote repo",
+    )
+    parser.add_argument("--no-ssh-reuse", action="store_true")
+    parser.add_argument("--ssh-control-path", default=DEFAULT_SSH_CONTROL_PATH)
+    parser.add_argument("--ssh-control-persist", default=DEFAULT_SSH_CONTROL_PERSIST)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Choose random BEAT2 test clips, run all four model inferences on a remote GPU "
+            "machine, and pull one folder per clip to your local machine."
+        )
+    )
+    parser.add_argument(
+        "--worker",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Run inference on this machine instead of using SSH (for debugging on the GPU host)",
+    )
+    add_shared_args(parser)
+    add_orchestrator_args(parser)
+    return parser.parse_args()
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.num_clips <= 0:
+        raise ValueError("--num-clips must be positive")
+    if args.fps <= 0:
+        raise ValueError("--fps must be positive")
+    if args.window_size <= 0 or args.stride <= 0:
+        raise ValueError("--window-size and --stride must be positive")
+    if args.sample_steps <= 0:
+        raise ValueError("--sample-steps must be positive")
+    if args.guidance_scale < 0:
+        raise ValueError("--guidance-scale cannot be negative")
+    if args.diffusion_seed_frames is not None and args.diffusion_seed_frames < 0:
+        raise ValueError("--diffusion-seed-frames cannot be negative")
+    if args.smooth_window < 1:
+        raise ValueError("--smooth-window must be at least 1")
+    if args.latent_smooth_window < 1:
+        raise ValueError("--latent-smooth-window must be at least 1")
+    if args.velocity_scale <= 0:
+        raise ValueError("--velocity-scale must be positive")
+    if not 0.0 <= args.rest_blend <= 1.0:
+        raise ValueError("--rest-blend must be in [0, 1]")
+
+
+def main() -> None:
+    args = parse_args()
+    validate_args(args)
+
+    if args.worker or args.local_only:
+        if args.worker:
+            if not args.split_csv or not args.audio_dir or not args.textgrid_dir:
+                raise ValueError("--worker requires --split-csv, --audio-dir, and --textgrid-dir")
+        else:
+            from BEATArc.config import AUDIO_DIR, SPLIT_CSV, TEXTGRID_DIR
+
+            args.split_csv = args.split_csv or str(SPLIT_CSV)
+            args.audio_dir = args.audio_dir or str(AUDIO_DIR)
+            args.textgrid_dir = args.textgrid_dir or str(TEXTGRID_DIR)
+        worker_main(args)
+        return
+
+    orchestrator_main(args)
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        print(f"[ERROR] Command failed with exit code {exc.returncode}", file=sys.stderr)
+        sys.exit(exc.returncode)
