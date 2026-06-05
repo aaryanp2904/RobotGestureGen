@@ -22,6 +22,7 @@ DEFAULT_CHECKPOINT = (
     f"{FYP_DATASET}/BEAT2_NAO_Latent_Diffusion_Checkpoints/latent_diffusion_best.pth"
 )
 DEFAULT_STATS = f"{BITBUCKET_ROOT}/Preprocessed_BEAT2_New/normalization_stats.json"
+DEFAULT_REMOTE_PYTHON = "/vol/bitbucket/ap1922/fyp_venv/bin/python"
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -174,8 +175,16 @@ def main():
     parser.add_argument("--rest-blend", type=float, default=0.5,
                         help="Remote low-energy rest blend strength")
     parser.add_argument("--local-dir", default="latent_diffusion_predictions")
-    parser.add_argument("--remote-python", default="python")
-    parser.add_argument("--remote-setup", default="")
+    parser.add_argument(
+        "--remote-python",
+        default=DEFAULT_REMOTE_PYTHON,
+        help="Python executable on the remote GPU machine (not --remote-setup)",
+    )
+    parser.add_argument(
+        "--remote-setup",
+        default="",
+        help="Optional shell prefix before inference, e.g. 'source /path/to/venv/bin/activate'",
+    )
     parser.add_argument("--server", default="http://localhost:8000")
     parser.add_argument("--no-assets", action="store_true")
     parser.add_argument("--play", action="store_true")
@@ -203,6 +212,15 @@ def main():
         raise ValueError("--velocity-scale must be positive")
     if not 0.0 <= args.rest_blend <= 1.0:
         raise ValueError("--rest-blend must be in [0, 1]")
+    if args.remote_setup and (
+        args.remote_setup.endswith("python")
+        or "/bin/python" in args.remote_setup
+        or args.remote_setup.endswith("python3")
+    ):
+        raise ValueError(
+            "--remote-setup is for shell commands (e.g. 'source .../activate'), not the Python "
+            f"interpreter. Use --remote-python {args.remote_setup!r} instead."
+        )
 
     ensure_ssh_control_dir(args)
     local_dir = Path(args.local_dir)
