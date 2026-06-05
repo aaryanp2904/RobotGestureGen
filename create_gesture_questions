@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
+import posixpath
 import random
 import shlex
 import shutil
@@ -103,6 +105,15 @@ def remote_quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def remote_path(base: str, *parts: str) -> str:
+    """Join Linux remote paths without Windows Path normalization."""
+    path = base.rstrip("/")
+    for part in parts:
+        if part:
+            path = posixpath.join(path, part.strip("/"))
+    return path
+
+
 def ssh_reuse_options(args: argparse.Namespace) -> list[str]:
     if args.no_ssh_reuse or os.name == "nt":
         return []
@@ -164,7 +175,8 @@ def run_remote_worker_session(args: argparse.Namespace) -> None:
 
     stdin = None
     if not args.no_sync_script:
-        stdin = open(REPO_ROOT / "create_gesture_questions", "rb")
+        script_bytes = (REPO_ROOT / "create_gesture_questions").read_bytes().replace(b"\r\n", b"\n")
+        stdin = io.BytesIO(script_bytes)
     try:
         print("[REMOTE] Single SSH session: sync script + run worker")
         subprocess.run(command, stdin=stdin, check=True)
@@ -454,13 +466,13 @@ def build_remote_worker_command(args: argparse.Namespace) -> str:
 
 
 def apply_remote_defaults(args: argparse.Namespace) -> None:
-    beat_root = Path(args.remote_beat_root)
-    args.split_csv = str(beat_root / "train_test_split.csv")
-    args.audio_dir = str(beat_root / "wave16k")
-    args.textgrid_dir = str(beat_root / "textgrid")
+    beat_root = args.remote_beat_root.rstrip("/")
+    args.split_csv = remote_path(beat_root, "train_test_split.csv")
+    args.audio_dir = remote_path(beat_root, "wave16k")
+    args.textgrid_dir = remote_path(beat_root, "textgrid")
     if args.remote_output_dir is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.remote_output_dir = f"{DEFAULT_REMOTE_OUTPUT_ROOT}/{stamp}"
+        args.remote_output_dir = remote_path(DEFAULT_REMOTE_OUTPUT_ROOT, stamp)
 
 
 def orchestrator_main(args: argparse.Namespace) -> None:
