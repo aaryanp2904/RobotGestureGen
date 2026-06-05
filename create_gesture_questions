@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import io
 import json
 import os
 import posixpath
@@ -173,16 +172,12 @@ def run_remote_worker_session(args: argparse.Namespace) -> None:
             print(f"[DRY-RUN] Script stdin: {REPO_ROOT / 'create_gesture_questions'}")
         return
 
-    stdin = None
+    script_input = None
     if not args.no_sync_script:
-        script_bytes = (REPO_ROOT / "create_gesture_questions").read_bytes().replace(b"\r\n", b"\n")
-        stdin = io.BytesIO(script_bytes)
-    try:
-        print("[REMOTE] Single SSH session: sync script + run worker")
-        subprocess.run(command, stdin=stdin, check=True)
-    finally:
-        if stdin is not None:
-            stdin.close()
+        script_input = (REPO_ROOT / "create_gesture_questions").read_bytes().replace(b"\r\n", b"\n")
+
+    print("[REMOTE] Single SSH session: sync script + run worker")
+    subprocess.run(command, input=script_input, check=True)
 
 
 def cleanup_remote_output(args: argparse.Namespace) -> None:
