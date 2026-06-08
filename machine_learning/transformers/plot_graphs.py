@@ -19,6 +19,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +36,10 @@ UNIT_ENERGY = "rad²/frame"
 DATASET_ORDER = ["Ground Truth", "Transformer"]
 DATASET_KEYS = {"Ground Truth": "ground_truth", "Transformer": "transformer"}
 COLORS = {"Ground Truth": "#2E86AB", "Transformer": "#D1495B"}
+DATASET_LEGEND_LABELS = {
+    "Ground Truth": "Ground truth (reference motion from dataset)",
+    "Transformer": "Transformer (model predictions)",
+}
 ARM_JOINTS = [
     "LShoulderPitch",
     "LShoulderRoll",
@@ -44,6 +50,148 @@ ARM_JOINTS = [
     "RElbowYaw",
     "RElbowRoll",
 ]
+
+
+def legend_label(dataset: str, detail: str | None = None) -> str:
+    base = DATASET_LEGEND_LABELS.get(dataset, dataset)
+    if detail:
+        return f"{base} — {detail}"
+    return base
+
+
+def condition_legend_handles(details: dict[str, str] | None = None) -> list:
+    handles = []
+    for dataset in DATASET_ORDER:
+        detail = (details or {}).get(dataset)
+        handles.append(
+            Patch(
+                facecolor=COLORS[dataset],
+                edgecolor="black",
+                linewidth=0.7,
+                label=legend_label(dataset, detail),
+            )
+        )
+    return handles
+
+
+SHORT_CONDITION_NAMES = {
+    "Ground Truth": "Ground truth",
+    "Transformer": "Transformer",
+}
+
+FIGURE_NOTES = {
+    "bar_sem": "Bars = mean per sequence; error bars = ±1 standard error of the mean (SEM).",
+    "boxplot": "Box = IQR; line = median; whiskers = 1.5×IQR.",
+    "joint_mean": "Bars = mean across matched sequences (no error bars).",
+    "histogram": "Each sample is one frame-to-frame joint velocity magnitude.",
+    "cdf": "Cumulative distribution of frame-to-frame joint velocity magnitudes.",
+    "pca": "Each point is one joint pose; PCA fitted on combined samples from both conditions.",
+}
+
+
+def short_condition_name(dataset: str) -> str:
+    return SHORT_CONDITION_NAMES.get(dataset, dataset)
+
+
+def xtick_with_count(dataset: str, count: int, unit: str = "sequences") -> str:
+    return f"{short_condition_name(dataset)}\n(n={count})"
+
+
+def place_legend_below(
+    ax,
+    handles: list,
+    *,
+    ncol: int = 1,
+    anchor_y: float = -0.12,
+    fontsize: float = 10,
+) -> None:
+    ax.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, anchor_y),
+        ncol=ncol,
+        framealpha=0.95,
+        fontsize=fontsize,
+        title="Legend",
+        borderaxespad=0.0,
+    )
+
+
+def finalize_figure(
+    fig,
+    ax,
+    *,
+    note: str | None = None,
+    bottom: float = 0.28,
+    top: float = 0.90,
+) -> None:
+    if note:
+        fig.text(0.5, 0.01, note, ha="center", va="bottom", fontsize=9.5, color="#333333")
+        bottom = max(bottom, 0.26)
+    fig.subplots_adjust(left=0.14, right=0.98, top=top, bottom=bottom)
+
+
+def color_legend_handles(*, include_sem: bool = False) -> list:
+    handles = [
+        Patch(
+            facecolor=COLORS[dataset],
+            edgecolor="black",
+            linewidth=0.7,
+            label=short_condition_name(dataset),
+        )
+        for dataset in DATASET_ORDER
+    ]
+    if include_sem:
+        handles.append(sem_errorbar_legend_handle())
+    return handles
+
+
+def apply_figure_note(note: str, bottom_margin: float = 0.16) -> None:
+    finalize_figure(plt.gcf(), plt.gca(), note=note, bottom=bottom_margin)
+
+
+def sem_errorbar_legend_handle() -> Line2D:
+    return Line2D(
+        [0],
+        [0],
+        color="black",
+        linewidth=1.2,
+        marker="|",
+        markersize=8,
+        label="Error bars: ±1 SEM",
+    )
+
+
+def bar_chart_legend(ax) -> None:
+    place_legend_below(ax, color_legend_handles(include_sem=True), ncol=1, anchor_y=-0.10)
+    finalize_figure(ax.figure, ax, note=FIGURE_NOTES["bar_sem"], bottom=0.34)
+
+
+def boxplot_legend(ax) -> None:
+    handles = color_legend_handles()
+    handles.extend(
+        [
+            Line2D([0], [0], color="black", linewidth=1.5, label="Line: median"),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linewidth=4,
+                alpha=0.35,
+                label="Box: IQR",
+            ),
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linewidth=1,
+                linestyle="--",
+                label="Whiskers: 1.5×IQR",
+            ),
+        ]
+    )
+    place_legend_below(ax, handles, ncol=2, anchor_y=-0.14, fontsize=9.5)
+    finalize_figure(ax.figure, ax, note=FIGURE_NOTES["boxplot"], bottom=0.40)
 
 
 def configure_style() -> None:
@@ -199,10 +347,10 @@ def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str]
 
 
 def save_figure(output_dir: Path, stem: str) -> None:
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{stem}.png")
-    plt.savefig(output_dir / f"{stem}.pdf")
-    plt.close()
+    fig = plt.gcf()
+    fig.savefig(output_dir / f"{stem}.png", bbox_inches="tight", pad_inches=0.15)
+    fig.savefig(output_dir / f"{stem}.pdf", bbox_inches="tight", pad_inches=0.15)
+    plt.close(fig)
 
 
 def bar_with_error(
@@ -221,8 +369,8 @@ def bar_with_error(
         for label in DATASET_ORDER
     ]
     x = np.arange(len(DATASET_ORDER))
-    plt.figure(figsize=(7, 6))
-    plt.bar(
+    fig, ax = plt.subplots(figsize=(7.5, 6.8))
+    ax.bar(
         x,
         means,
         yerr=sems,
@@ -230,26 +378,32 @@ def bar_with_error(
         color=[COLORS[label] for label in DATASET_ORDER],
         edgecolor="black",
         linewidth=0.7,
+        error_kw={"elinewidth": 1.2, "ecolor": "black", "capthick": 1.2},
     )
-    plt.xticks(x, [f"{label}\n(n={sample_counts[label]})" for label in DATASET_ORDER])
-    plt.ylabel(ylabel)
-    plt.title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels([xtick_with_count(label, sample_counts[label]) for label in DATASET_ORDER])
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    ax.margins(x=0.15)
+    bar_chart_legend(ax)
     save_figure(output_dir, stem)
 
 
 def boxplot_metric(output_dir: Path, stem: str, title: str, ylabel: str, values: dict[str, np.ndarray]) -> None:
-    plt.figure(figsize=(7, 5))
-    box = plt.boxplot(
+    fig, ax = plt.subplots(figsize=(7.5, 7.0))
+    box = ax.boxplot(
         [values[label] for label in DATASET_ORDER],
-        labels=DATASET_ORDER,
+        labels=[xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
         patch_artist=True,
         showfliers=False,
     )
     for patch, label in zip(box["boxes"], DATASET_ORDER):
         patch.set_facecolor(COLORS[label])
         patch.set_alpha(0.65)
-    plt.ylabel(ylabel)
-    plt.title(title)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    ax.margins(x=0.15)
+    boxplot_legend(ax)
     save_figure(output_dir, stem)
 
 
@@ -263,21 +417,24 @@ def grouped_joint_plot(
 ) -> None:
     x = np.arange(len(joint_names))
     width = 0.34
-    plt.figure(figsize=(max(10, 0.55 * len(joint_names)), 6))
+    fig, ax = plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5))
     for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
-        plt.bar(
+        ax.bar(
             x + offset,
             values[dataset],
             width,
-            label=dataset,
+            label=short_condition_name(dataset),
             color=COLORS[dataset],
             edgecolor="black",
             linewidth=0.4,
         )
-    plt.xticks(x, joint_names, rotation=45, ha="right")
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.legend()
+    ax.set_xticks(x)
+    ax.set_xticklabels(joint_names, rotation=45, ha="right")
+    ax.set_xlabel("Joint")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    place_legend_below(ax, color_legend_handles(), ncol=2, anchor_y=-0.12)
+    finalize_figure(fig, ax, note=FIGURE_NOTES["joint_mean"], bottom=0.30)
     save_figure(output_dir, stem)
 
 
@@ -294,9 +451,9 @@ def overlaid_histogram(
         return
     upper = np.percentile(np.concatenate(non_empty), 99.5)
     hist_range = (0.0, max(float(upper), 1e-6))
-    plt.figure(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(9, 7.0))
     for dataset in DATASET_ORDER:
-        plt.hist(
+        ax.hist(
             values[dataset],
             bins=bins,
             range=hist_range,
@@ -304,25 +461,33 @@ def overlaid_histogram(
             histtype="step",
             linewidth=2.4,
             color=COLORS[dataset],
-            label=f"{dataset} (n={len(values[dataset]):,})",
+            label=short_condition_name(dataset),
         )
-    plt.xlabel(xlabel)
-    plt.ylabel("Density")
-    plt.title(title)
-    plt.legend()
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Probability density")
+    ax.set_title(title, pad=14)
+    place_legend_below(ax, color_legend_handles(), ncol=2, anchor_y=-0.10)
+    finalize_figure(fig, ax, note=FIGURE_NOTES["histogram"], bottom=0.30)
     save_figure(output_dir, stem)
 
 
 def cdf_plot(output_dir: Path, stem: str, title: str, xlabel: str, values: dict[str, np.ndarray]) -> None:
-    plt.figure(figsize=(9, 6))
+    fig, ax = plt.subplots(figsize=(9, 7.0))
     for dataset in DATASET_ORDER:
         arr = np.sort(values[dataset])
         y = np.linspace(0.0, 1.0, len(arr), endpoint=True)
-        plt.plot(arr, y, linewidth=2.4, color=COLORS[dataset], label=dataset)
-    plt.xlabel(xlabel)
-    plt.ylabel("Cumulative probability")
-    plt.title(title)
-    plt.legend()
+        ax.plot(
+            arr,
+            y,
+            linewidth=2.4,
+            color=COLORS[dataset],
+            label=short_condition_name(dataset),
+        )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Cumulative probability")
+    ax.set_title(title, pad=14)
+    place_legend_below(ax, color_legend_handles(), ncol=2, anchor_y=-0.10)
+    finalize_figure(fig, ax, note=FIGURE_NOTES["cdf"], bottom=0.30)
     save_figure(output_dir, stem)
 
 
@@ -351,22 +516,23 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Transformer": projected[split:],
     }
-    plt.figure(figsize=(9, 7))
+    fig, ax = plt.subplots(figsize=(9, 8.0))
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
-        plt.scatter(
+        ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
             s=7,
             alpha=0.24,
             color=COLORS[dataset],
-            label=f"{dataset} (poses={len(chunk):,})",
+            label=short_condition_name(dataset),
             rasterized=True,
         )
-    plt.xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
-    plt.ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
-    plt.title("PCA Motion Coverage: Ground Truth vs Transformer")
-    plt.legend(markerscale=2)
+    ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance explained)")
+    ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance explained)")
+    ax.set_title("PCA Motion Coverage: Ground Truth vs Transformer", pad=14)
+    place_legend_below(ax, color_legend_handles(), ncol=2, anchor_y=-0.10)
+    finalize_figure(fig, ax, note=FIGURE_NOTES["pca"], bottom=0.30)
     save_figure(output_dir, "10_pca_motion_coverage")
 
 

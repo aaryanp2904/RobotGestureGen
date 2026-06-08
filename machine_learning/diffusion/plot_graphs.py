@@ -17,6 +17,10 @@ from machine_learning.transformers import plot_graphs as plots
 
 DATASET_ORDER = ["Ground Truth", "Diffusion"]
 COLORS = {"Ground Truth": "#2E86AB", "Diffusion": "#7B2CBF"}
+DATASET_LEGEND_LABELS = {
+    "Ground Truth": "Ground truth (reference motion from dataset)",
+    "Diffusion": "Diffusion model (predictions)",
+}
 
 
 def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, list[np.ndarray]]]:
@@ -103,22 +107,23 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Diffusion": projected[split:],
     }
-    plots.plt.figure(figsize=(9, 7))
+    fig, ax = plots.plt.subplots(figsize=(9, 8.0))
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
-        plots.plt.scatter(
+        ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
             s=7,
             alpha=0.24,
             color=COLORS[dataset],
-            label=f"{dataset} (poses={len(chunk):,})",
+            label=plots.short_condition_name(dataset),
             rasterized=True,
         )
-    plots.plt.xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
-    plots.plt.ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
-    plots.plt.title("PCA Motion Coverage: Ground Truth vs Diffusion")
-    plots.plt.legend(markerscale=2)
+    ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance explained)")
+    ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance explained)")
+    ax.set_title("PCA Motion Coverage: Ground Truth vs Diffusion", pad=14)
+    plots.place_legend_below(ax, plots.color_legend_handles(), ncol=2, anchor_y=-0.10)
+    plots.finalize_figure(fig, ax, note=plots.FIGURE_NOTES["pca"], bottom=0.30)
     plots.save_figure(output_dir, "10_pca_motion_coverage")
 
 
@@ -126,6 +131,11 @@ def use_diffusion_plot_labels() -> None:
     plots.DATASET_ORDER = DATASET_ORDER
     plots.DATASET_KEYS = {"Ground Truth": "ground_truth", "Diffusion": "diffusion"}
     plots.COLORS = COLORS
+    plots.DATASET_LEGEND_LABELS = DATASET_LEGEND_LABELS
+    plots.SHORT_CONDITION_NAMES = {
+        "Ground Truth": "Ground truth",
+        "Diffusion": "Diffusion",
+    }
 
 
 def symlog_linthresh(values: dict[str, np.ndarray]) -> float:
@@ -141,10 +151,10 @@ def symlog_linthresh(values: dict[str, np.ndarray]) -> float:
     return float(max(np.min(positive) / 10.0, np.max(positive) / 1e6, 1e-9))
 
 
-def apply_symlog_y(values: dict[str, np.ndarray], ylabel: str) -> None:
-    plots.plt.yscale("symlog", linthresh=symlog_linthresh(values), linscale=0.5)
-    plots.plt.ylabel(f"{ylabel} (symlog scale)")
-    plots.plt.grid(True, which="both", axis="y", alpha=0.25)
+def apply_symlog_y(ax, values: dict[str, np.ndarray], ylabel: str) -> None:
+    ax.set_yscale("symlog", linthresh=symlog_linthresh(values), linscale=0.5)
+    ax.set_ylabel(f"{ylabel} (symlog scale)")
+    ax.grid(True, which="both", axis="y", alpha=0.25)
 
 
 def bar_with_error(
@@ -164,8 +174,8 @@ def bar_with_error(
         for label in DATASET_ORDER
     ]
     x = np.arange(len(DATASET_ORDER))
-    plots.plt.figure(figsize=(7, 6))
-    plots.plt.bar(
+    fig, ax = plots.plt.subplots(figsize=(7.5, 6.8))
+    ax.bar(
         x,
         means,
         yerr=sems,
@@ -173,13 +183,19 @@ def bar_with_error(
         color=[COLORS[label] for label in DATASET_ORDER],
         edgecolor="black",
         linewidth=0.7,
+        error_kw={"elinewidth": 1.2, "ecolor": "black", "capthick": 1.2},
     )
-    plots.plt.xticks(x, [f"{label}\n(n={sample_counts[label]})" for label in DATASET_ORDER])
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [plots.xtick_with_count(label, sample_counts[label]) for label in DATASET_ORDER]
+    )
     if symlog:
-        apply_symlog_y(values, ylabel)
+        apply_symlog_y(ax, values, ylabel)
     else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
+        ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    ax.margins(x=0.15)
+    plots.bar_chart_legend(ax)
     plots.save_figure(output_dir, stem)
 
 
@@ -191,10 +207,10 @@ def boxplot_metric(
     values: dict[str, np.ndarray],
     symlog: bool = False,
 ) -> None:
-    plots.plt.figure(figsize=(7, 5))
-    box = plots.plt.boxplot(
+    fig, ax = plots.plt.subplots(figsize=(7.5, 7.0))
+    box = ax.boxplot(
         [values[label] for label in DATASET_ORDER],
-        labels=DATASET_ORDER,
+        labels=[plots.xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
         patch_artist=True,
         showfliers=False,
     )
@@ -202,10 +218,12 @@ def boxplot_metric(
         patch.set_facecolor(COLORS[label])
         patch.set_alpha(0.65)
     if symlog:
-        apply_symlog_y(values, ylabel)
+        apply_symlog_y(ax, values, ylabel)
     else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
+        ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    ax.margins(x=0.15)
+    plots.boxplot_legend(ax)
     plots.save_figure(output_dir, stem)
 
 
@@ -220,24 +238,27 @@ def grouped_joint_plot(
 ) -> None:
     x = np.arange(len(joint_names))
     width = 0.34
-    plots.plt.figure(figsize=(max(10, 0.55 * len(joint_names)), 6))
+    fig, ax = plots.plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5))
     for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
-        plots.plt.bar(
+        ax.bar(
             x + offset,
             values[dataset],
             width,
-            label=dataset,
+            label=plots.short_condition_name(dataset),
             color=COLORS[dataset],
             edgecolor="black",
             linewidth=0.4,
         )
-    plots.plt.xticks(x, joint_names, rotation=45, ha="right")
+    ax.set_xticks(x)
+    ax.set_xticklabels(joint_names, rotation=45, ha="right")
+    ax.set_xlabel("Joint")
     if symlog:
-        apply_symlog_y(values, ylabel)
+        apply_symlog_y(ax, values, ylabel)
     else:
-        plots.plt.ylabel(ylabel)
-    plots.plt.title(title)
-    plots.plt.legend()
+        ax.set_ylabel(ylabel)
+    ax.set_title(title, pad=14)
+    plots.place_legend_below(ax, plots.color_legend_handles(), ncol=2, anchor_y=-0.12)
+    plots.finalize_figure(fig, ax, note=plots.FIGURE_NOTES["joint_mean"], bottom=0.30)
     plots.save_figure(output_dir, stem)
 
 

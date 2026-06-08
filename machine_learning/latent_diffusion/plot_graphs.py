@@ -19,14 +19,26 @@ from machine_learning.transformers import plot_graphs as plots  # noqa: E402
 DATASET_ORDER = ["Ground Truth", "Latent Diffusion"]
 DATASET_KEYS = {"Ground Truth": "ground_truth", "Latent Diffusion": "latent_diffusion"}
 COLORS = {"Ground Truth": "#2E86AB", "Latent Diffusion": "#F77F00"}
+DATASET_LEGEND_LABELS = {
+    "Ground Truth": "Ground truth (reference motion from dataset)",
+    "Latent Diffusion": "Latent diffusion model (predictions)",
+}
 
 
 def use_latent_plot_labels() -> None:
+    short_names = {
+        "Ground Truth": "Ground truth",
+        "Latent Diffusion": "Latent diffusion",
+    }
     plots.DATASET_ORDER = DATASET_ORDER
     plots.DATASET_KEYS = DATASET_KEYS
     plots.COLORS = COLORS
+    plots.DATASET_LEGEND_LABELS = DATASET_LEGEND_LABELS
+    plots.SHORT_CONDITION_NAMES = short_names
     diff_plots.DATASET_ORDER = DATASET_ORDER
     diff_plots.COLORS = COLORS
+    diff_plots.DATASET_LEGEND_LABELS = DATASET_LEGEND_LABELS
+    diff_plots.SHORT_CONDITION_NAMES = short_names
 
 
 def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, list[np.ndarray]]]:
@@ -113,22 +125,23 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Latent Diffusion": projected[split:],
     }
-    plots.plt.figure(figsize=(9, 7))
+    fig, ax = plots.plt.subplots(figsize=(9, 8.0))
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
-        plots.plt.scatter(
+        ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
             s=7,
             alpha=0.24,
             color=COLORS[dataset],
-            label=f"{dataset} (poses={len(chunk):,})",
+            label=plots.short_condition_name(dataset),
             rasterized=True,
         )
-    plots.plt.xlabel(f"PC1 ({100 * explained[0]:.1f}% variance)")
-    plots.plt.ylabel(f"PC2 ({100 * explained[1]:.1f}% variance)")
-    plots.plt.title("PCA Motion Coverage: Ground Truth vs Latent Diffusion")
-    plots.plt.legend(markerscale=2)
+    ax.set_xlabel(f"PC1 ({100 * explained[0]:.1f}% variance explained)")
+    ax.set_ylabel(f"PC2 ({100 * explained[1]:.1f}% variance explained)")
+    ax.set_title("PCA Motion Coverage: Ground Truth vs Latent Diffusion", pad=14)
+    plots.place_legend_below(ax, plots.color_legend_handles(), ncol=2, anchor_y=-0.10)
+    plots.finalize_figure(fig, ax, note=plots.FIGURE_NOTES["pca"], bottom=0.30)
     plots.save_figure(output_dir, "10_pca_motion_coverage")
 
 
