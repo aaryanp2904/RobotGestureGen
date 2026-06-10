@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Pull a BEAT2 datapoint with ground truth and four model predictions for local playback.
+"""Pull a BEAT2 datapoint with ground truth and five model predictions for local playback.
 
 Transfers, for one clip ID:
   - WAV and TextGrid sidecars
   - ground_truth.npy (from preprocessed NAO angles, or raw SMPL-X motion)
-  - diffusion.npy, latent_diffusion.npy, transformers.npy, transformers_delta.npy
+  - diffusion.npy, latent_diffusion.npy, latent_diffusion_smoothed.npy,
+    transformers.npy, transformers_delta.npy
 
 Run from your local machine. Files are staged on the remote host in one SSH call,
 then copied locally in one scp transfer.
@@ -51,6 +52,7 @@ from machine_learning.transformers_delta.remote_infer_pull import (  # noqa: E40
 BITBUCKET_ROOT = "/vol/bitbucket/ap1922"
 DEFAULT_REMOTE_PREPROCESSED = f"{BITBUCKET_ROOT}/BEAT2_NAO_Preprocessed"
 DEFAULT_REMOTE_BUNDLE_DIR = f"{BITBUCKET_ROOT}/gesture_questions"
+LATENT_DIFFUSION_SMOOTHED_PRED_DIR = f"{BITBUCKET_ROOT}/latent_diffusion_predictions_smoothed"
 DEFAULT_LOCAL_DIR = "gesture_datapoints"
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
@@ -69,6 +71,7 @@ GESTURE_SOURCES = (
     GestureSource("ground_truth.npy", f"{DEFAULT_REMOTE_PREPROCESSED}/clips"),
     GestureSource("diffusion.npy", DIFFUSION_PRED_DIR),
     GestureSource("latent_diffusion.npy", LATENT_DIFFUSION_PRED_DIR),
+    GestureSource("latent_diffusion_smoothed.npy", LATENT_DIFFUSION_SMOOTHED_PRED_DIR),
     GestureSource("transformers.npy", TRANSFORMER_PRED_DIR),
     GestureSource("transformers_delta.npy", TRANSFORMER_DELTA_PRED_DIR),
 )
@@ -200,6 +203,7 @@ motion = Path({motion_dir!r})
 pred_dirs = [
     bitbucket / "diffusion_predictions",
     bitbucket / "latent_diffusion_predictions",
+    bitbucket / "latent_diffusion_predictions_smoothed",
     bitbucket / "transformer_predictions",
     bitbucket / "transformer_delta_predictions",
 ]
@@ -296,7 +300,7 @@ def choose_random_clip_id(args: argparse.Namespace) -> str:
 
     if not pool:
         raise RuntimeError(
-            f"No {args.split!r} clips with all four model predictions were found on the remote. "
+            f"No {args.split!r} clips with all model predictions were found on the remote. "
             "Run inference first, or use create_gesture_questions to populate "
             f"{args.remote_bundle_dir}."
         )
@@ -367,6 +371,19 @@ def fetch_bundle_assets(args: argparse.Namespace, clip_id: str, clip_dir: Path) 
     return True
 
 
+def ensure_smoothed_latent_prediction(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
+    """Fetch smoothed latent-diffusion prediction when using a pre-built bundle."""
+    local_path = clip_dir / "latent_diffusion_smoothed.npy"
+    if local_path.is_file() and not args.overwrite:
+        print(f"[SKIP] Local gesture exists: {local_path}")
+        return
+    if args.dry_run:
+        print(f"[DRY-RUN] Would fetch smoothed latent diffusion prediction for {clip_id}")
+        return
+    remote_npy = remote_path(LATENT_DIFFUSION_SMOOTHED_PRED_DIR, f"{clip_id}.npy")
+    scp_from_remote(args, remote_npy, local_path, required=True)
+
+
 def ensure_ground_truth_source(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
     """Fetch a preprocessed or raw motion .npz when the bundle path omitted ground truth."""
     if args.dry_run:
@@ -433,6 +450,7 @@ def build_remote_stage_script(args: argparse.Namespace, clip_id: str) -> str:
             "textgrid": Path({remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid")!r}),
             "diffusion.npy": Path({remote_path(DIFFUSION_PRED_DIR, f"{clip_id}.npy")!r}),
             "latent_diffusion.npy": Path({remote_path(LATENT_DIFFUSION_PRED_DIR, f"{clip_id}.npy")!r}),
+            "latent_diffusion_smoothed.npy": Path({remote_path(LATENT_DIFFUSION_SMOOTHED_PRED_DIR, f"{clip_id}.npy")!r}),
             "transformers.npy": Path({remote_path(TRANSFORMER_PRED_DIR, f"{clip_id}.npy")!r}),
             "transformers_delta.npy": Path({remote_path(TRANSFORMER_DELTA_PRED_DIR, f"{clip_id}.npy")!r}),
         }}
@@ -565,6 +583,7 @@ def fetch_datapoint(args: argparse.Namespace, clip_id: str) -> tuple[Path, bool]
         if args.prefer_bundle and bundle_is_available(args, clip_id):
             fetch_bundle_assets(args, clip_id, clip_dir)
             ensure_ground_truth_source(args, clip_id, clip_dir)
+            ensure_smoothed_latent_prediction(args, clip_id, clip_dir)
         else:
             stage_dir = stage_remote_clip(args, clip_id)
             scp_dir_from_remote(args, stage_dir, clip_dir)
@@ -580,8 +599,8 @@ def fetch_datapoint(args: argparse.Namespace, clip_id: str) -> tuple[Path, bool]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Pull WAV, TextGrid, ground truth, and four model gesture predictions "
-            "for one BEAT2 clip to your local machine."
+            "Pull WAV, TextGrid, ground truth, and five model gesture predictions "
+            "(including smoothed latent diffusion) for one BEAT2 clip to your local machine."
         )
     )
     parser.add_argument(
@@ -593,7 +612,7 @@ def parse_args() -> argparse.Namespace:
         "--random",
         action="store_true",
         help=(
-            "Choose a random clip that already has all four model predictions on bitbucket "
+            "Choose a random clip that already has all model predictions on bitbucket "
             "(discovered in a single SSH call)"
         ),
     )
@@ -607,6 +626,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_REMOTE_BUNDLE_DIR,
         help=(
             "Remote folder with pre-built per-clip bundles (wav, textgrid, four model .npy files). "
+            "Smoothed latent diffusion is copied separately. "
             "Set to '' to disable bundle copy."
         ),
     )
