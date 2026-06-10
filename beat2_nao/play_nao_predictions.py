@@ -105,6 +105,35 @@ def build_frame_texts(num_frames: int, fps: float, word_list, time_offset=0.0):
     return frame_texts
 
 
+def load_wav_pcm_bytes(wav_path: Path) -> tuple[int, int, bytes]:
+    """Load WAV audio as 16-bit PCM bytes plus sample rate and channel count."""
+    try:
+        with wave.open(str(wav_path), "rb") as wav_file:
+            if wav_file.getsampwidth() != 2:
+                raise wave.Error(f"unsupported sample width: {wav_file.getsampwidth()}")
+            return (
+                wav_file.getframerate(),
+                wav_file.getnchannels(),
+                wav_file.readframes(wav_file.getnframes()),
+            )
+    except wave.Error:
+        from scipy.io import wavfile
+
+        sample_rate, samples = wavfile.read(str(wav_path))
+        if samples.dtype in (np.float32, np.float64):
+            samples = np.clip(samples, -1.0, 1.0)
+            samples = (samples * 32767.0).astype(np.int16)
+        elif samples.dtype == np.int32:
+            samples = (samples // 65536).astype(np.int16)
+        elif samples.dtype == np.uint8:
+            samples = ((samples.astype(np.int16) - 128) * 256).astype(np.int16)
+        elif samples.dtype != np.int16:
+            samples = samples.astype(np.int16)
+
+        channels = 1 if samples.ndim == 1 else samples.shape[1]
+        return int(sample_rate), int(channels), samples.tobytes()
+
+
 def play_audio_in_thread(wav_path: Path | None, start_delay=1.5):
     global _audio_stop
     if wav_path is None:
@@ -116,26 +145,25 @@ def play_audio_in_thread(wav_path: Path | None, start_delay=1.5):
     def _play():
         global _audio_stop
         try:
-            time.sleep(start_delay)
-            with wave.open(str(wav_path), "rb") as wav_file:
-                import pyaudio
+            import pyaudio
 
-                p = pyaudio.PyAudio()
-                stream = p.open(
-                    format=p.get_format_from_width(wav_file.getsampwidth()),
-                    channels=wav_file.getnchannels(),
-                    rate=wav_file.getframerate(),
-                    output=True,
-                )
-                chunk = 2048
-                while not _audio_stop:
-                    data = wav_file.readframes(chunk)
-                    if not data:
-                        break
-                    stream.write(data)
-                stream.stop_stream()
-                stream.close()
-                p.terminate()
+            time.sleep(start_delay)
+            sample_rate, channels, pcm_bytes = load_wav_pcm_bytes(wav_path)
+            p = pyaudio.PyAudio()
+            stream = p.open(
+                format=pyaudio.paInt16,
+                channels=channels,
+                rate=sample_rate,
+                output=True,
+            )
+            chunk_bytes = 2048 * channels * 2
+            for offset in range(0, len(pcm_bytes), chunk_bytes):
+                if _audio_stop:
+                    break
+                stream.write(pcm_bytes[offset : offset + chunk_bytes])
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
         except Exception as exc:
             print(f"[WARN] Audio playback failed: {exc}")
 

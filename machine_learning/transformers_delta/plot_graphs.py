@@ -26,7 +26,8 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.nao_constants import NAO_JOINTS  # noqa: E402
+from beat2_nao.nao_constants import NAO_JOINTS  # noqa: E402
+from machine_learning import plot_style as ps  # noqa: E402
 
 UNIT_ANGLE = "rad"
 UNIT_ANGLE_SQ = "rad²"
@@ -35,7 +36,10 @@ UNIT_ENERGY = "rad²/frame"
 
 DATASET_ORDER = ["Ground Truth", "Delta Transformer"]
 DATASET_KEYS = {"Ground Truth": "ground_truth", "Delta Transformer": "transformer_delta"}
-COLORS = {"Ground Truth": "#2E86AB", "Delta Transformer": "#D1495B"}
+COLORS = {
+    "Ground Truth": ps.COLOR_GROUND_TRUTH,
+    "Delta Transformer": ps.COLOR_TRANSFORMER_DELTA,
+}
 DATASET_LEGEND_LABELS = {
     "Ground Truth": "Ground truth (reference motion from dataset)",
     "Delta Transformer": "Delta Transformer (model predictions)",
@@ -63,14 +67,8 @@ def condition_legend_handles(details: dict[str, str] | None = None) -> list:
     handles = []
     for dataset in DATASET_ORDER:
         detail = (details or {}).get(dataset)
-        handles.append(
-            Patch(
-                facecolor=COLORS[dataset],
-                edgecolor="black",
-                linewidth=0.7,
-                label=legend_label(dataset, detail),
-            )
-        )
+        label = legend_label(dataset, detail)
+        handles.append(ps.color_patch(COLORS[dataset], label))
     return handles
 
 
@@ -105,16 +103,7 @@ def place_legend_below(
     anchor_y: float = -0.12,
     fontsize: float = 10,
 ) -> None:
-    ax.legend(
-        handles=handles,
-        loc="upper center",
-        bbox_to_anchor=(0.5, anchor_y),
-        ncol=ncol,
-        framealpha=0.95,
-        fontsize=fontsize,
-        title="Legend",
-        borderaxespad=0.0,
-    )
+    ps.place_legend_below(ax, handles, ncol=ncol, anchor_y=anchor_y, fontsize=fontsize)
 
 
 def finalize_figure(
@@ -125,22 +114,11 @@ def finalize_figure(
     bottom: float = 0.28,
     top: float = 0.90,
 ) -> None:
-    if note:
-        fig.text(0.5, 0.01, note, ha="center", va="bottom", fontsize=9.5, color="#333333")
-        bottom = max(bottom, 0.26)
-    fig.subplots_adjust(left=0.14, right=0.98, top=top, bottom=bottom)
+    ps.finalize_figure(fig, ax, note=note, bottom=bottom, top=top)
 
 
 def color_legend_handles(*, include_sem: bool = False) -> list:
-    handles = [
-        Patch(
-            facecolor=COLORS[dataset],
-            edgecolor="black",
-            linewidth=0.7,
-            label=short_condition_name(dataset),
-        )
-        for dataset in DATASET_ORDER
-    ]
+    handles = [ps.color_patch(COLORS[dataset], short_condition_name(dataset)) for dataset in DATASET_ORDER]
     if include_sem:
         handles.append(sem_errorbar_legend_handle())
     return handles
@@ -151,15 +129,7 @@ def apply_figure_note(note: str, bottom_margin: float = 0.16) -> None:
 
 
 def sem_errorbar_legend_handle() -> Line2D:
-    return Line2D(
-        [0],
-        [0],
-        color="black",
-        linewidth=1.2,
-        marker="|",
-        markersize=8,
-        label="Error bars: ±1 SEM",
-    )
+    return ps.sem_errorbar_legend_handle()
 
 
 def bar_chart_legend(ax) -> None:
@@ -171,23 +141,9 @@ def boxplot_legend(ax) -> None:
     handles = color_legend_handles()
     handles.extend(
         [
-            Line2D([0], [0], color="black", linewidth=1.5, label="Line: median"),
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linewidth=4,
-                alpha=0.35,
-                label="Box: IQR",
-            ),
-            Line2D(
-                [0],
-                [0],
-                color="black",
-                linewidth=1,
-                linestyle="--",
-                label="Whiskers: 1.5×IQR",
-            ),
+            Line2D([0], [0], color=ps.ACCENT_LINE, linewidth=1.6, label="Line: median"),
+            Line2D([0], [0], color=ps.SPINE_COLOR, linewidth=4, alpha=0.55, label="Box: IQR"),
+            Line2D([0], [0], color=ps.SPINE_COLOR, linewidth=1.2, linestyle="--", label="Whiskers: 1.5×IQR"),
         ]
     )
     place_legend_below(ax, handles, ncol=2, anchor_y=-0.14, fontsize=9.5)
@@ -195,23 +151,7 @@ def boxplot_legend(ax) -> None:
 
 
 def configure_style() -> None:
-    plt.rcParams.update(
-        {
-            "figure.figsize": (10, 6),
-            "figure.dpi": 140,
-            "savefig.dpi": 300,
-            "font.size": 14,
-            "axes.titlesize": 17,
-            "axes.labelsize": 15,
-            "xtick.labelsize": 12,
-            "ytick.labelsize": 12,
-            "legend.fontsize": 12,
-            "axes.grid": True,
-            "grid.alpha": 0.25,
-            "axes.spines.top": False,
-            "axes.spines.right": False,
-        }
-    )
+    ps.configure_style()
 
 
 def load_gesture(path: Path) -> np.ndarray:
@@ -324,7 +264,7 @@ def discover_matched_files(gt_dir: Path, transformer_dir: Path, pattern: str) ->
 def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str], dict[str, list[np.ndarray]]]:
     dirs = {
         "Ground Truth": Path(args.ground_truth_dir),
-        "Delta Transformer": Path(args.transformer_dir),
+        "Delta Transformer": Path(args.delta_transformer_dir),
     }
     filenames = discover_matched_files(dirs["Ground Truth"], dirs["Delta Transformer"], args.pattern)
     data = {name: [] for name in DATASET_ORDER}
@@ -347,10 +287,7 @@ def load_matched_dataset(args: argparse.Namespace) -> tuple[list[str], list[str]
 
 
 def save_figure(output_dir: Path, stem: str) -> None:
-    fig = plt.gcf()
-    fig.savefig(output_dir / f"{stem}.png", bbox_inches="tight", pad_inches=0.15)
-    fig.savefig(output_dir / f"{stem}.pdf", bbox_inches="tight", pad_inches=0.15)
-    plt.close(fig)
+    ps.save_figure(output_dir, stem)
 
 
 def format_value(value: float) -> str:
@@ -390,19 +327,21 @@ def bar_with_error(
         for label in DATASET_ORDER
     ]
     x = np.arange(len(DATASET_ORDER))
-    fig, ax = plt.subplots(figsize=(7.5, 6.8))
-    bars = ax.bar(
-        x,
-        means,
-        yerr=sems,
-        capsize=6,
-        color=[COLORS[label] for label in DATASET_ORDER],
-        edgecolor="black",
-        linewidth=0.7,
-        error_kw={"elinewidth": 1.2, "ecolor": "black", "capthick": 1.2},
-    )
+    fig, ax = plt.subplots(figsize=(7.5, 6.8), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
+    bar_patches = []
+    for idx, label in enumerate(DATASET_ORDER):
+        container = ax.bar(
+            x[idx],
+            means[idx],
+            yerr=sems[idx],
+            width=0.58,
+            **ps.bar_kwargs(COLORS[label]),
+            error_kw=ps.errorbar_kwargs(),
+        )
+        bar_patches.append(container[0])
     maybe_use_symlog_y(means)
-    for bar, mean in zip(bars, means):
+    for bar, mean in zip(bar_patches, means):
         y = bar.get_height()
         va = "bottom" if y >= 0 else "top"
         ax.annotate(
@@ -413,6 +352,7 @@ def bar_with_error(
             ha="center",
             va=va,
             fontsize=10,
+            color=ps.MUTED_TEXT,
         )
     ax.set_xticks(x)
     ax.set_xticklabels([xtick_with_count(label, sample_counts[label]) for label in DATASET_ORDER])
@@ -424,17 +364,18 @@ def bar_with_error(
 
 
 def boxplot_metric(output_dir: Path, stem: str, title: str, ylabel: str, values: dict[str, np.ndarray]) -> None:
-    fig, ax = plt.subplots(figsize=(7.5, 7.0))
+    fig, ax = plt.subplots(figsize=(7.5, 7.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     box = ax.boxplot(
         [values[label] for label in DATASET_ORDER],
-        labels=[xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
+        tick_labels=[xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
         patch_artist=True,
         showfliers=False,
+        widths=0.52,
+        medianprops={"linewidth": 0},
     )
     maybe_use_symlog_y([values[dataset] for dataset in DATASET_ORDER])
-    for patch, label in zip(box["boxes"], DATASET_ORDER):
-        patch.set_facecolor(COLORS[label])
-        patch.set_alpha(0.65)
+    ps.style_boxplot(box, [COLORS[label] for label in DATASET_ORDER])
     ax.set_ylabel(ylabel)
     ax.set_title(title, pad=14, wrap=True)
     ax.margins(x=0.15)
@@ -451,8 +392,9 @@ def grouped_joint_plot(
     values: dict[str, np.ndarray],
 ) -> None:
     x = np.arange(len(joint_names))
-    width = 0.34
-    fig, ax = plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5))
+    width = 0.36
+    fig, ax = plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     maybe_use_symlog_y([values[dataset] for dataset in DATASET_ORDER])
     for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
         ax.bar(
@@ -460,9 +402,7 @@ def grouped_joint_plot(
             values[dataset],
             width,
             label=short_condition_name(dataset),
-            color=COLORS[dataset],
-            edgecolor="black",
-            linewidth=0.4,
+            **ps.bar_kwargs(COLORS[dataset]),
         )
     ax.set_xticks(x)
     ax.set_xticklabels(joint_names, rotation=45, ha="right")
@@ -487,17 +427,30 @@ def overlaid_histogram(
         return
     upper = np.percentile(np.concatenate(non_empty), 99.5)
     hist_range = (0.0, max(float(upper), 1e-6))
-    fig, ax = plt.subplots(figsize=(9, 7.0))
+    fig, ax = plt.subplots(figsize=(9, 7.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     for dataset in DATASET_ORDER:
+        color = COLORS[dataset]
+        ax.hist(
+            values[dataset],
+            bins=bins,
+            range=hist_range,
+            density=True,
+            histtype="stepfilled",
+            alpha=0.28,
+            color=color,
+            edgecolor=ps.darker_edge(color),
+            linewidth=1.2,
+            label=short_condition_name(dataset),
+        )
         ax.hist(
             values[dataset],
             bins=bins,
             range=hist_range,
             density=True,
             histtype="step",
-            linewidth=2.4,
-            color=COLORS[dataset],
-            label=short_condition_name(dataset),
+            linewidth=2.0,
+            color=ps.darker_edge(color),
         )
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Probability density")
@@ -508,11 +461,14 @@ def overlaid_histogram(
 
 
 def cdf_plot(output_dir: Path, stem: str, title: str, xlabel: str, values: dict[str, np.ndarray]) -> None:
-    fig, ax = plt.subplots(figsize=(9, 7.0))
+    fig, ax = plt.subplots(figsize=(9, 7.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     for dataset in DATASET_ORDER:
         arr = np.sort(values[dataset])
         y = np.linspace(0.0, 1.0, len(arr), endpoint=True)
-        ax.plot(arr, y, linewidth=2.4, color=COLORS[dataset], label=short_condition_name(dataset))
+        color = COLORS[dataset]
+        ax.plot(arr, y, linewidth=5.0, color=color, alpha=0.14, solid_capstyle="round", zorder=1)
+        ax.plot(arr, y, linewidth=2.6, color=color, label=short_condition_name(dataset), alpha=0.95, zorder=2)
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Cumulative probability")
     ax.set_title(title, pad=14)
@@ -546,15 +502,19 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Delta Transformer": projected[split:],
     }
-    fig, ax = plt.subplots(figsize=(9, 8.0))
+    fig, ax = plt.subplots(figsize=(9, 8.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax, grid_axis="both")
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
+        color = COLORS[dataset]
         ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
-            s=7,
-            alpha=0.24,
-            color=COLORS[dataset],
+            s=10,
+            alpha=0.34,
+            color=color,
+            edgecolors=ps.darker_edge(color),
+            linewidths=0.15,
             label=short_condition_name(dataset),
             rasterized=True,
         )
@@ -675,7 +635,7 @@ def print_summary_table(metrics: dict[str, dict[str, np.ndarray]], tests: dict) 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate Delta Transformer gestures against ground truth")
     parser.add_argument("--ground-truth-dir", required=True)
-    parser.add_argument("--transformer-dir", required=True)
+    parser.add_argument("--delta-transformer-dir", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--pattern", default="*.npy")
     parser.add_argument("--fps", type=int, default=30)

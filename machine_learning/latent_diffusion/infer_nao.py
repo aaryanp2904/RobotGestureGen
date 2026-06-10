@@ -14,7 +14,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.infer_nao import (  # noqa: E402
+from beat2_nao.infer_nao import (  # noqa: E402
     build_features,
     build_speaker_condition,
     clamp_nao_angles,
@@ -30,9 +30,9 @@ from BEATArc.infer_nao import (  # noqa: E402
     speaker_id_from_clip_id,
     window_starts,
 )
-from BEATArc.config import AUDIO_DIR, MOCAP_FPS, TEXTGRID_DIR  # noqa: E402
-from BEATArc.nao_constants import NAO_JOINTS  # noqa: E402
-from BEATArc.preprocess_nao import PROSODY_FEATURE_NAMES  # noqa: E402
+from beat2_nao.config import AUDIO_DIR, MOCAP_FPS, TEXTGRID_DIR  # noqa: E402
+from beat2_nao.nao_constants import NAO_JOINTS  # noqa: E402
+from beat2_nao.preprocess_nao import PROSODY_FEATURE_NAMES  # noqa: E402
 
 from .model import DiffusionSchedule, LatentDenoiser, MotionAutoencoder  # noqa: E402
 

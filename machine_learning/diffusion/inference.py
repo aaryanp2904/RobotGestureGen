@@ -14,8 +14,8 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.config import AUDIO_DIR, MOCAP_FPS, TEXTGRID_DIR  # noqa: E402
-from BEATArc import infer_nao  # noqa: E402
+from beat2_nao.config import AUDIO_DIR, MOCAP_FPS, TEXTGRID_DIR  # noqa: E402
+from beat2_nao import infer_nao  # noqa: E402
 
 
 def _append_optional(command: list[str], flag: str, value) -> None:
@@ -25,7 +25,7 @@ def _append_optional(command: list[str], flag: str, value) -> None:
 
 def build_infer_argv(args: argparse.Namespace) -> list[str]:
     command = [
-        "BEATArc/infer_nao.py",
+        "beat2_nao/infer_nao.py",
         "--checkpoint",
         str(args.checkpoint),
         "--stats",

@@ -6,7 +6,7 @@ Run this script from your local machine, inside the repository checkout that can
 reach your local NAO server/simulator. It will:
 
   1. SSH to the remote GPU host.
-  2. Run BEATArc/infer_nao.py remotely.
+  2. Run beat2_nao/infer_nao.py remotely.
   3. Copy the predicted .npy/.json and optional WAV/TextGrid files locally.
   4. Print the local playback command.
 
@@ -85,7 +85,7 @@ def build_remote_infer_command(args, remote_output: str) -> str:
         f"cd {remote_quote(args.remote_repo)} && "
         f"{setup}"
         f"mkdir -p {remote_quote(args.remote_pred_dir)} && "
-        f"{remote_quote(args.remote_python)} BEATArc/infer_nao.py "
+        f"{remote_quote(args.remote_python)} beat2_nao/infer_nao.py "
         f"--checkpoint {remote_quote(args.checkpoint)} "
         f"--stats {remote_quote(args.stats)} "
         f"--clip-id {remote_quote(args.clip_id)} "
@@ -166,7 +166,7 @@ def build_playback_command(local_dir: Path, clip_id: str, server: str,
     textgrid = local_dir / f"{clip_id}.TextGrid"
     command = [
         sys.executable,
-        str(REPO_ROOT / "BEATArc" / "play_nao_predictions.py"),
+        str(REPO_ROOT / "beat2_nao" / "play_nao_predictions.py"),
         str(pred),
         "--server",
         server,

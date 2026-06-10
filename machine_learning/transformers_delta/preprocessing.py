@@ -27,10 +27,10 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.config import AUDIO_DIR, MOCAP_FPS, MOTION_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
-from BEATArc.nao_constants import NAO_JOINTS  # noqa: E402
-from BEATArc.parse_annotations import parse_textgrid  # noqa: E402
-from BEATArc.preprocess_nao import (  # noqa: E402
+from beat2_nao.config import AUDIO_DIR, MOCAP_FPS, MOTION_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
+from beat2_nao.nao_constants import NAO_JOINTS  # noqa: E402
+from beat2_nao.parse_annotations import parse_textgrid  # noqa: E402
+from beat2_nao.preprocess_nao import (  # noqa: E402
     DEFAULT_WAVLM_MODEL,
     PROSODY_FEATURE_NAMES,
     TEXT_EMBED_DIM,

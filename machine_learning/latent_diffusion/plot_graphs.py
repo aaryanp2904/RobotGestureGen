@@ -13,12 +13,16 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from machine_learning import plot_style as ps  # noqa: E402
 from machine_learning.diffusion import plot_graphs as diff_plots  # noqa: E402
 from machine_learning.transformers import plot_graphs as plots  # noqa: E402
 
 DATASET_ORDER = ["Ground Truth", "Latent Diffusion"]
 DATASET_KEYS = {"Ground Truth": "ground_truth", "Latent Diffusion": "latent_diffusion"}
-COLORS = {"Ground Truth": "#2E86AB", "Latent Diffusion": "#F77F00"}
+COLORS = {
+    "Ground Truth": ps.COLOR_GROUND_TRUTH,
+    "Latent Diffusion": ps.COLOR_LATENT_DIFFUSION,
+}
 DATASET_LEGEND_LABELS = {
     "Ground Truth": "Ground truth (reference motion from dataset)",
     "Latent Diffusion": "Latent diffusion model (predictions)",
@@ -125,15 +129,19 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Latent Diffusion": projected[split:],
     }
-    fig, ax = plots.plt.subplots(figsize=(9, 8.0))
+    fig, ax = plots.plt.subplots(figsize=(9, 8.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax, grid_axis="both")
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
+        color = COLORS[dataset]
         ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
-            s=7,
-            alpha=0.24,
-            color=COLORS[dataset],
+            s=10,
+            alpha=0.34,
+            color=color,
+            edgecolors=ps.darker_edge(color),
+            linewidths=0.15,
             label=plots.short_condition_name(dataset),
             rasterized=True,
         )

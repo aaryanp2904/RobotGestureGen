@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "motion_logic"))
 import main_ik_client
 from main_ik_client import (
     clamp, normalize, cross_product,
-    bvh_to_nao_space, solve_nao_arm_ik,
+    mocap_to_nao_space, solve_nao_arm_ik,
     play_audio_in_thread,
 )
 try:
@@ -48,7 +48,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # SMPL-X pose slices (body joint index → poses array column)
 # Body joint i → poses[3 + i*3 : 3 + (i+1)*3]
-# SMPL-X coordinate system: X=Left, Y=Up, Z=Forward (same as BVH)
+# SMPL-X uses the standard motion-capture convention: X=Left, Y=Up, Z=Forward
 # ---------------------------------------------------------------------------
 _S = lambda idx: slice(3 + idx * 3, 3 + (idx + 1) * 3)
 
@@ -93,9 +93,9 @@ def map_smplx_to_nao(poses_frame):
               @ _R(poses_frame, "spine2") @ _R(poses_frame, "spine3")
     R_head_global = R_torso @ _R(poses_frame, "neck") @ _R(poses_frame, "head")
 
-    # SMPL-X forward is +Z (same as BVH). Extract gaze vector.
+    # SMPL-X forward is +Z. Extract gaze vector.
     v_head_fwd = R_head_global @ np.array([0.0, 0.0, 1.0])
-    v_head_nao = bvh_to_nao_space(v_head_fwd.tolist())
+    v_head_nao = mocap_to_nao_space(v_head_fwd.tolist())
 
     # --- HEAD INVERSE KINEMATICS ---
     head_yaw = math.atan2(v_head_nao[1], v_head_nao[0])
@@ -121,10 +121,10 @@ def map_smplx_to_nao(poses_frame):
 
     # --- ARM INVERSE KINEMATICS (reuse from main_ik_client) ---
     r_p, r_r, r_y, r_er = solve_nao_arm_ik(
-        bvh_to_nao_space(v_upper_r), bvh_to_nao_space(v_lower_r), is_left=False
+        mocap_to_nao_space(v_upper_r), mocap_to_nao_space(v_lower_r), is_left=False
     )
     l_p, l_r, l_y, l_er = solve_nao_arm_ik(
-        bvh_to_nao_space(v_upper_l), bvh_to_nao_space(v_lower_l), is_left=True
+        mocap_to_nao_space(v_upper_l), mocap_to_nao_space(v_lower_l), is_left=True
     )
 
     return {

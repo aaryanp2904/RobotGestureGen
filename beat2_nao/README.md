@@ -1,6 +1,6 @@
-# BEATArc
+# beat2_nao
 
-BEATArc contains the current BEAT2 to NAO workflow:
+beat2_nao contains the current BEAT2 to NAO workflow:
 
 - inspect or play BEAT2 dataset motion on NAO with IK,
 - preprocess BEAT2 audio/text/motion into NAO LMDB training data,
@@ -14,26 +14,26 @@ Older Phase 1 extraction scripts are archived in `legacy_phase1/`.
 Play a specific BEAT2 clip through the local NAO server:
 
 ```bash
-python BEATArc/BEATDemo.py 10_kieks_0_103_103 --server http://localhost:8000
+python beat2_nao/BEATDemo.py 10_kieks_0_103_103 --server http://localhost:8000
 ```
 
 Pick a random clip:
 
 ```bash
-python BEATArc/BEATDemo.py --random --server http://localhost:8000
+python beat2_nao/BEATDemo.py --random --server http://localhost:8000
 ```
 
 Fetch a datapoint from the remote BEAT2 dataset, copy its WAV locally, and
 export the original motion as NAO joint angles:
 
 ```bash
-python BEATArc/fetch_nao_datapoint.py 10_kieks_0_103_103
+python beat2_nao/fetch_nao_datapoint.py 10_kieks_0_103_103
 ```
 
 Fetch, convert, and play it on the local NAO server:
 
 ```bash
-python BEATArc/fetch_nao_datapoint.py 10_kieks_0_103_103 --play --server http://localhost:8000
+python beat2_nao/fetch_nao_datapoint.py 10_kieks_0_103_103 --play --server http://localhost:8000
 ```
 
 Outputs are written under `nao_datapoints/<tag>/`:
@@ -48,7 +48,7 @@ Outputs are written under `nao_datapoints/<tag>/`:
 Create split-specific LMDBs and normalization stats:
 
 ```bash
-python BEATArc/preprocess_nao.py \
+python beat2_nao/preprocess_nao.py \
   --motion-dir /vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0/smplxflame_30 \
   --audio-dir /vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0/wave16k \
   --split-csv /vol/bitbucket/ap1922/BEAT2/beat_english_v2.0.0/train_test_split.csv \
@@ -65,7 +65,7 @@ All DOC machine access goes through `shell1.doc.ic.ac.uk`, which is the default
 jump host used by this helper:
 
 ```bash
-python BEATArc/remote_infer_pull.py 10_kieks_0_103_103
+python beat2_nao/remote_infer_pull.py 10_kieks_0_103_103
 ```
 
 By default, the helper reuses one SSH connection for the remote inference and
@@ -73,26 +73,26 @@ subsequent `scp` pulls, so password-based logins should only prompt once per
 run. If multiplexing causes trouble on a host, disable it:
 
 ```bash
-python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 --no-ssh-reuse
+python beat2_nao/remote_infer_pull.py 10_kieks_0_103_103 --no-ssh-reuse
 ```
 
 Run inference, pull outputs, and start local playback:
 
 ```bash
-python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 --play
+python beat2_nao/remote_infer_pull.py 10_kieks_0_103_103 --play
 ```
 
 If the remote machine needs environment setup:
 
 ```bash
-python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 \
+python beat2_nao/remote_infer_pull.py 10_kieks_0_103_103 \
   --remote-setup "source .venv/bin/activate"
 ```
 
 Run a diffusion checkpoint remotely and pull the generated files locally:
 
 ```bash
-python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 \
+python beat2_nao/remote_infer_pull.py 10_kieks_0_103_103 \
   --model-type diffusion \
   --checkpoint /vol/bitbucket/ap1922/path/to/diffusion_best.pth \
   --stats /vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed/normalization_stats.json \
@@ -107,7 +107,7 @@ python BEATArc/remote_infer_pull.py 10_kieks_0_103_103 \
 Run a diffusion checkpoint locally and write the prediction files directly:
 
 ```bash
-python BEATArc/infer_nao.py \
+python beat2_nao/infer_nao.py \
   --checkpoint /path/to/diffusion_best.pth \
   --stats /path/to/BEAT2_NAO_Preprocessed/normalization_stats.json \
   --clip-id 10_kieks_0_103_103 \
@@ -127,7 +127,7 @@ python BEATArc/infer_nao.py \
 Dry-run a generated prediction payload:
 
 ```bash
-python BEATArc/play_nao_predictions.py \
+python beat2_nao/play_nao_predictions.py \
   nao_predictions/10_kieks_0_103_103.npy \
   --wav nao_predictions/10_kieks_0_103_103.wav \
   --textgrid nao_predictions/10_kieks_0_103_103.TextGrid \
@@ -137,7 +137,7 @@ python BEATArc/play_nao_predictions.py \
 Play it on the local NAO server:
 
 ```bash
-python BEATArc/play_nao_predictions.py \
+python beat2_nao/play_nao_predictions.py \
   nao_predictions/10_kieks_0_103_103.npy \
   --wav nao_predictions/10_kieks_0_103_103.wav \
   --textgrid nao_predictions/10_kieks_0_103_103.TextGrid \

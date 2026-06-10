@@ -1,10 +1,10 @@
 # Latent Diffusion Gesture Training
 
 This package implements the latent diffusion pipeline for BEAT2/NAO gesture
-generation. It reuses the existing BEATArc preprocessing format:
+generation. It reuses the existing beat2_nao preprocessing format:
 
 - `x`: per-frame conditioning features, such as prosody, WavLM, and text.
-- `y`: normalized NAO motion targets from `BEATArc/preprocess_nao.py`.
+- `y`: normalized NAO motion targets from `beat2_nao/preprocess_nao.py`.
 - `speaker`: optional one-hot speaker conditioning.
 - `valid_mask`: valid frames in padded windows.
 
@@ -15,12 +15,12 @@ The model is trained in three stages:
 3. Train an audio-conditioned diffusion model that predicts clean latents.
 
 Inference samples latents from audio, decodes them back to normalized NAO joint
-angles, then uses the existing BEATArc denormalization, clamping, smoothing, and
+angles, then uses the existing beat2_nao denormalization, clamping, smoothing, and
 velocity limiting.
 
 ## Do I Need To Preprocess Again?
 
-No, not if you already have BEATArc preprocessed LMDBs and the matching
+No, not if you already have beat2_nao preprocessed LMDBs and the matching
 `normalization_stats.json`.
 
 You can reuse existing preprocessing when you have:
@@ -180,5 +180,5 @@ python -m machine_learning.latent_diffusion.remote_infer_pull \
   --velocity-limit
 ```
 
-The remote helper prints the local `BEATArc/play_nao_predictions.py` command
+The remote helper prints the local `beat2_nao/play_nao_predictions.py` command
 after copying the `.npy`, metadata `.json`, WAV, and TextGrid files.

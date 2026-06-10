@@ -13,10 +13,14 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+from machine_learning import plot_style as ps
 from machine_learning.transformers import plot_graphs as plots
 
 DATASET_ORDER = ["Ground Truth", "Diffusion"]
-COLORS = {"Ground Truth": "#2E86AB", "Diffusion": "#7B2CBF"}
+COLORS = {
+    "Ground Truth": ps.COLOR_GROUND_TRUTH,
+    "Diffusion": ps.COLOR_DIFFUSION,
+}
 DATASET_LEGEND_LABELS = {
     "Ground Truth": "Ground truth (reference motion from dataset)",
     "Diffusion": "Diffusion model (predictions)",
@@ -107,15 +111,19 @@ def pca_plot(output_dir: Path, poses: dict[str, np.ndarray], max_points: int, se
         "Ground Truth": projected[:split],
         "Diffusion": projected[split:],
     }
-    fig, ax = plots.plt.subplots(figsize=(9, 8.0))
+    fig, ax = plots.plt.subplots(figsize=(9, 8.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax, grid_axis="both")
     for dataset in DATASET_ORDER:
         chunk = chunks[dataset]
+        color = COLORS[dataset]
         ax.scatter(
             chunk[:, 0],
             chunk[:, 1],
-            s=7,
-            alpha=0.24,
-            color=COLORS[dataset],
+            s=10,
+            alpha=0.34,
+            color=color,
+            edgecolors=ps.darker_edge(color),
+            linewidths=0.15,
             label=plots.short_condition_name(dataset),
             rasterized=True,
         )
@@ -154,7 +162,7 @@ def symlog_linthresh(values: dict[str, np.ndarray]) -> float:
 def apply_symlog_y(ax, values: dict[str, np.ndarray], ylabel: str) -> None:
     ax.set_yscale("symlog", linthresh=symlog_linthresh(values), linscale=0.5)
     ax.set_ylabel(f"{ylabel} (symlog scale)")
-    ax.grid(True, which="both", axis="y", alpha=0.25)
+    ps.style_axes(ax, grid_axis="both")
 
 
 def bar_with_error(
@@ -174,17 +182,17 @@ def bar_with_error(
         for label in DATASET_ORDER
     ]
     x = np.arange(len(DATASET_ORDER))
-    fig, ax = plots.plt.subplots(figsize=(7.5, 6.8))
-    ax.bar(
-        x,
-        means,
-        yerr=sems,
-        capsize=6,
-        color=[COLORS[label] for label in DATASET_ORDER],
-        edgecolor="black",
-        linewidth=0.7,
-        error_kw={"elinewidth": 1.2, "ecolor": "black", "capthick": 1.2},
-    )
+    fig, ax = plots.plt.subplots(figsize=(7.5, 6.8), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
+    for idx, label in enumerate(DATASET_ORDER):
+        ax.bar(
+            x[idx],
+            means[idx],
+            yerr=sems[idx],
+            width=0.58,
+            **ps.bar_kwargs(COLORS[label]),
+            error_kw=ps.errorbar_kwargs(),
+        )
     ax.set_xticks(x)
     ax.set_xticklabels(
         [plots.xtick_with_count(label, sample_counts[label]) for label in DATASET_ORDER]
@@ -207,16 +215,17 @@ def boxplot_metric(
     values: dict[str, np.ndarray],
     symlog: bool = False,
 ) -> None:
-    fig, ax = plots.plt.subplots(figsize=(7.5, 7.0))
+    fig, ax = plots.plt.subplots(figsize=(7.5, 7.0), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     box = ax.boxplot(
         [values[label] for label in DATASET_ORDER],
-        labels=[plots.xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
+        tick_labels=[plots.xtick_with_count(label, len(values[label])) for label in DATASET_ORDER],
         patch_artist=True,
         showfliers=False,
+        widths=0.52,
+        medianprops={"linewidth": 0},
     )
-    for patch, label in zip(box["boxes"], DATASET_ORDER):
-        patch.set_facecolor(COLORS[label])
-        patch.set_alpha(0.65)
+    ps.style_boxplot(box, [COLORS[label] for label in DATASET_ORDER])
     if symlog:
         apply_symlog_y(ax, values, ylabel)
     else:
@@ -238,16 +247,15 @@ def grouped_joint_plot(
 ) -> None:
     x = np.arange(len(joint_names))
     width = 0.34
-    fig, ax = plots.plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5))
+    fig, ax = plots.plt.subplots(figsize=(max(11, 0.6 * len(joint_names)), 7.5), facecolor=ps.FIGURE_FACECOLOR)
+    ps.style_axes(ax)
     for offset, dataset in zip([-width / 2, width / 2], DATASET_ORDER):
         ax.bar(
             x + offset,
             values[dataset],
             width,
             label=plots.short_condition_name(dataset),
-            color=COLORS[dataset],
-            edgecolor="black",
-            linewidth=0.4,
+            **ps.bar_kwargs(COLORS[dataset]),
         )
     ax.set_xticks(x)
     ax.set_xticklabels(joint_names, rotation=45, ha="right")

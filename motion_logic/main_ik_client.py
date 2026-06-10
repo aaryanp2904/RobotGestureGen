@@ -145,8 +145,8 @@ def cross_product(v, w):
         v[0]*w[1] - v[1]*w[0]
     ]
 
-def bvh_to_nao_space(v):
-    """Converts BVH space (X=Left, Y=Up, Z=Forward) to NAO space (X=Fwd, Y=Left, Z=Up)."""
+def mocap_to_nao_space(v):
+    """Convert motion-capture coords (X=Left, Y=Up, Z=Forward) to NAO (X=Fwd, Y=Left, Z=Up)."""
     return [v[2], v[0], v[1]]
 
 def solve_nao_arm_ik(V_nao, W_nao, is_left):
@@ -193,7 +193,7 @@ def map_bvh_to_nao(bvh_frame, channels):
     
     # BVH Default forward is usually +Z. Extract the human's absolute gaze vector.
     v_head_fwd = rotate_vector(R_head_global, [0, 0, 1])
-    v_head_nao = bvh_to_nao_space(v_head_fwd)
+    v_head_nao = mocap_to_nao_space(v_head_fwd)
     
     # --- HEAD INVERSE KINEMATICS ---
     # X is Forward, Y is Left, Z is Up in NAO space
@@ -229,8 +229,8 @@ def map_bvh_to_nao(bvh_frame, channels):
     v_lower_l = rotate_vector(R_lower_l, [24.7844, -0.574804, -0.667058])
 
     # --- ARM INVERSE KINEMATICS ---
-    r_p, r_r, r_y, r_er = solve_nao_arm_ik(bvh_to_nao_space(v_upper_r), bvh_to_nao_space(v_lower_r), is_left=False)
-    l_p, l_r, l_y, l_er = solve_nao_arm_ik(bvh_to_nao_space(v_upper_l), bvh_to_nao_space(v_lower_l), is_left=True)
+    r_p, r_r, r_y, r_er = solve_nao_arm_ik(mocap_to_nao_space(v_upper_r), mocap_to_nao_space(v_lower_r), is_left=False)
+    l_p, l_r, l_y, l_er = solve_nao_arm_ik(mocap_to_nao_space(v_upper_l), mocap_to_nao_space(v_lower_l), is_left=True)
 
     return {
         "HeadYaw":        clamp(head_yaw, -2.08, 2.08),

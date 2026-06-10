@@ -12,7 +12,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from BEATArc.config import AUDIO_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
+from beat2_nao.config import AUDIO_DIR, SPLIT_CSV, TEXTGRID_DIR  # noqa: E402
 
 try:
     from .infer_nao import generate

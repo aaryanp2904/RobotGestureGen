@@ -25,9 +25,9 @@ try:
     from .nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
 except ImportError:
     sys.path.insert(0, str(REPO_ROOT))
-    from BEATArc.BEATDemo import map_smplx_to_nao, resolve_frame_window
-    from BEATArc.config import MOCAP_FPS
-    from BEATArc.nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
+    from beat2_nao.BEATDemo import map_smplx_to_nao, resolve_frame_window
+    from beat2_nao.config import MOCAP_FPS
+    from beat2_nao.nao_constants import NAO_JOINTS, NAO_LIMITS, NAO_MAX_VEL
 
 
 DEFAULT_REMOTE = "ap1922@oak21.doc.ic.ac.uk"
@@ -225,7 +225,7 @@ def write_outputs(args, local_paths: dict[str, Path]) -> dict:
 def build_playback_command(args, local_paths: dict[str, Path], metadata: dict) -> list[str]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "BEATArc" / "play_nao_predictions.py"),
+        str(REPO_ROOT / "beat2_nao" / "play_nao_predictions.py"),
         str(local_paths["nao"]),
         "--server",
         args.server,

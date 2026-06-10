@@ -106,7 +106,7 @@ def scp_from_remote(args: argparse.Namespace, remote_path: str, local_dir: Path)
 def build_playback_command(local_dir: Path, clip_id: str, server: str, include_assets=True, dry_run=False) -> list[str]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "BEATArc" / "play_nao_predictions.py"),
+        str(REPO_ROOT / "beat2_nao" / "play_nao_predictions.py"),
         str(local_dir / f"{clip_id}.npy"),
         "--server",
         server,
