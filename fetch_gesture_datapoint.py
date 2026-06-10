@@ -12,7 +12,6 @@ Run from your local machine. Files are copied from the remote GPU host via SSH/s
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import posixpath
@@ -20,7 +19,6 @@ import random
 import shlex
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,11 +42,15 @@ from machine_learning.transformers_delta.remote_infer_pull import (  # noqa: E40
     DEFAULT_REMOTE_PRED_DIR as TRANSFORMER_DELTA_PRED_DIR,
 )
 
-DEFAULT_REMOTE_PREPROCESSED = "/vol/bitbucket/ap1922/BEAT2_NAO_Preprocessed"
+BITBUCKET_ROOT = "/vol/bitbucket/ap1922"
+DEFAULT_REMOTE_PREPROCESSED = f"{BITBUCKET_ROOT}/BEAT2_NAO_Preprocessed"
+DEFAULT_REMOTE_BUNDLE_DIR = f"{BITBUCKET_ROOT}/gesture_questions"
 DEFAULT_LOCAL_DIR = "gesture_datapoints"
 DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
 DEFAULT_SERVER = "http://localhost:8000"
+
+_REMOTE_CLIP_CACHE: dict[tuple[str, str, str, str], dict[str, list[str]]] = {}
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,18 @@ def ssh_command(args: argparse.Namespace, remote_command: str) -> list[str]:
     return command
 
 
+def run_ssh(args: argparse.Namespace, remote_command: str, required: bool = True) -> subprocess.CompletedProcess:
+    command = ssh_command(args, remote_command)
+    print(f"[CMD] {printable_command(command)}")
+    if args.dry_run:
+        return subprocess.CompletedProcess(command, 0, stdout=b"[]", stderr=b"")
+    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    if result.returncode != 0 and required:
+        stderr = result.stderr.strip() or result.stdout.strip() or "unknown error"
+        raise subprocess.CalledProcessError(result.returncode, command, output=result.stdout, stderr=stderr)
+    return result
+
+
 def scp_from_remote(
     args: argparse.Namespace,
     remote_path_str: str,
@@ -137,74 +151,140 @@ def scp_from_remote(
     return run_command(command, dry_run=args.dry_run, required=required)
 
 
+def scp_dir_from_remote(
+    args: argparse.Namespace,
+    remote_dir: str,
+    local_dir: Path,
+    required: bool = True,
+) -> bool:
+    if not args.dry_run:
+        local_dir.parent.mkdir(parents=True, exist_ok=True)
+    command = ["scp", "-r"]
+    command.extend(ssh_reuse_options(args))
+    if args.jump_host:
+        command.extend(["-o", f"ProxyJump={args.jump_host}"])
+    command.extend([f"{args.remote}:{remote_dir.rstrip('/')}", str(local_dir)])
+    return run_command(command, dry_run=args.dry_run, required=required)
+
+
 def remote_gesture_path(source: GestureSource, clip_id: str) -> str:
     if source.local_name == "ground_truth.npy":
         return remote_path(source.remote_dir, f"{clip_id}.npz")
     return remote_path(source.remote_dir, f"{clip_id}.npy")
 
 
-def remote_asset_paths(args: argparse.Namespace, clip_id: str) -> dict[str, str]:
+def build_remote_list_script(args: argparse.Namespace) -> str:
     beat_root = args.remote_beat_root.rstrip("/")
-    paths = {
-        "wav": remote_path(beat_root, "wave16k", f"{clip_id}.wav"),
-        "textgrid": remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid"),
+    bundle_dir = (args.remote_bundle_dir or "").rstrip("/")
+    return f"""import csv, json, os
+from pathlib import Path
+
+bitbucket = Path({BITBUCKET_ROOT!r})
+beat = Path({beat_root!r})
+bundle_root = Path({bundle_dir!r})
+preprocessed = Path({args.remote_preprocessed_dir!r}) / "clips"
+pred_dirs = [
+    bitbucket / "diffusion_predictions",
+    bitbucket / "latent_diffusion_predictions",
+    bitbucket / "transformer_predictions",
+    bitbucket / "transformer_delta_predictions",
+]
+
+def stems(directory):
+    if not directory.is_dir():
+        return set()
+    return {{path.stem for path in directory.glob("*.npy")}}
+
+complete = None
+for directory in pred_dirs:
+    ids = stems(directory)
+    complete = ids if complete is None else complete & ids
+
+if preprocessed.is_dir():
+    complete &= {{path.stem for path in preprocessed.glob("*.npz")}}
+
+split = {args.split!r}
+if split:
+    split_csv = beat / "train_test_split.csv"
+    if split_csv.is_file():
+        with split_csv.open(newline="") as handle:
+            allowed = {{
+                row["id"]
+                for row in csv.DictReader(handle)
+                if row.get("type") == split and row.get("id")
+            }}
+        complete &= allowed
+
+bundle_ids = set()
+if bundle_root.is_dir():
+    for entry in bundle_root.iterdir():
+        if not entry.is_dir():
+            continue
+        clip_id = entry.name
+        expected = [
+            entry / f"{{clip_id}}.wav",
+            entry / "diffusion.npy",
+            entry / "latent_diffusion.npy",
+            entry / "transformers.npy",
+            entry / "transformers_delta.npy",
+        ]
+        if all(path.is_file() for path in expected):
+            bundle_ids.add(clip_id)
+
+print(json.dumps({{
+    "complete": sorted(complete or []),
+    "bundle": sorted(bundle_ids),
+}}))
+"""
+
+
+def list_remote_clip_ids(args: argparse.Namespace) -> dict[str, list[str]]:
+    cache_key = (
+        args.remote,
+        args.split,
+        args.remote_bundle_dir or "",
+        args.remote_preprocessed_dir,
+    )
+    if cache_key in _REMOTE_CLIP_CACHE:
+        return _REMOTE_CLIP_CACHE[cache_key]
+
+    script = build_remote_list_script(args)
+    quoted_script = shlex.quote(script)
+    result = run_ssh(args, f"python3 -c {quoted_script}")
+    try:
+        payload = json.loads(result.stdout.strip() or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Could not parse remote clip list: {result.stdout!r}") from exc
+    remote_ids = {
+        "complete": payload.get("complete") or [],
+        "bundle": payload.get("bundle") or [],
     }
-    for source in GESTURE_SOURCES:
-        paths[source.local_name] = remote_gesture_path(source, clip_id)
-    return paths
-
-
-def remote_files_exist(args: argparse.Namespace, clip_id: str) -> bool:
-    paths = list(remote_asset_paths(args, clip_id).values())
-    tests = " && ".join(f"test -f {shlex.quote(path)}" for path in paths)
-    command = ssh_command(args, tests)
-    if args.dry_run:
-        print(f"[DRY-RUN] Would verify remote assets for {clip_id}")
-        return True
-    result = subprocess.run(command, check=False)
-    return result.returncode == 0
-
-
-def fetch_split_csv(args: argparse.Namespace) -> Path:
-    split_csv = Path(args.split_csv) if args.split_csv else None
-    if split_csv and split_csv.is_file():
-        return split_csv
-
-    if not args.remote_split_csv:
-        beat_root = args.remote_beat_root.rstrip("/")
-        args.remote_split_csv = remote_path(beat_root, "train_test_split.csv")
-
-    local_csv = Path(tempfile.gettempdir()) / "beat2_train_test_split.csv"
-    scp_from_remote(args, args.remote_split_csv, local_csv, required=True)
-    return local_csv
-
-
-def read_clip_ids(split_csv: Path, split: str) -> list[str]:
-    with open(split_csv, "r", newline="") as handle:
-        rows = csv.DictReader(handle)
-        clip_ids = [row["id"] for row in rows if row.get("type") == split and row.get("id")]
-    if not clip_ids:
-        raise RuntimeError(f"No {split!r} clips found in {split_csv}")
-    return clip_ids
+    _REMOTE_CLIP_CACHE[cache_key] = remote_ids
+    return remote_ids
 
 
 def choose_random_clip_id(args: argparse.Namespace) -> str:
-    split_csv = fetch_split_csv(args)
-    clip_ids = read_clip_ids(split_csv, args.split)
+    print("[RANDOM] Listing clips that already exist on bitbucket (one SSH call)...")
+    remote_ids = list_remote_clip_ids(args)
+    bundle_ids = set(remote_ids["bundle"])
+    if args.prefer_bundle and bundle_ids:
+        pool = sorted(bundle_ids)
+        source = f"bundle dir {args.remote_bundle_dir}"
+    else:
+        pool = remote_ids["complete"]
+        source = "prediction directories on bitbucket"
+
+    if not pool:
+        raise RuntimeError(
+            f"No {args.split!r} clips with all four model predictions were found on the remote. "
+            "Run inference first, or use create_gesture_questions to populate "
+            f"{args.remote_bundle_dir}."
+        )
+
     rng = random.Random(args.seed)
-    rng.shuffle(clip_ids)
-
-    attempts = min(len(clip_ids), args.random_attempts)
-    for clip_id in clip_ids[:attempts]:
-        if remote_files_exist(args, clip_id):
-            print(f"[RANDOM] Selected clip with complete remote assets: {clip_id}")
-            return clip_id
-        print(f"[RANDOM] Skipping incomplete clip: {clip_id}")
-
-    raise RuntimeError(
-        f"Could not find a {args.split!r} clip with all required remote files "
-        f"after checking {attempts} candidates."
-    )
+    clip_id = rng.choice(pool)
+    print(f"[RANDOM] Selected {clip_id} from {len(pool)} ready clips in {source}")
+    return clip_id
 
 
 def resolve_clip_id(args: argparse.Namespace) -> str:
@@ -230,6 +310,43 @@ def export_ground_truth(npz_path: Path, output_path: Path) -> None:
     print(f"[OUT] Ground truth: {output_path} ({angles.shape})")
 
 
+def remote_bundle_dir(args: argparse.Namespace, clip_id: str) -> str:
+    return remote_path(args.remote_bundle_dir, clip_id)
+
+
+def bundle_is_available(args: argparse.Namespace, clip_id: str) -> bool:
+    if not args.remote_bundle_dir:
+        return False
+    if args.dry_run:
+        return args.prefer_bundle
+    remote_ids = list_remote_clip_ids(args)
+    return clip_id in set(remote_ids["bundle"])
+
+
+def fetch_bundle_assets(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> bool:
+    remote_dir = remote_bundle_dir(args, clip_id)
+    print(f"[FETCH] Using existing bundle: {remote_dir}")
+    scp_dir_from_remote(args, remote_dir, clip_dir)
+    return True
+
+
+def copy_ground_truth(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
+    local_path = clip_dir / "ground_truth.npy"
+    if local_path.is_file() and not args.overwrite:
+        print(f"[SKIP] Local gesture exists: {local_path}")
+        return
+
+    temp_npz = clip_dir / f"{clip_id}.npz"
+    remote_src = remote_path(args.remote_preprocessed_dir, "clips", f"{clip_id}.npz")
+    scp_from_remote(args, remote_src, temp_npz, required=True)
+    if args.dry_run:
+        print(f"[DRY-RUN] Would export ground truth from {temp_npz}")
+        return
+    export_ground_truth(temp_npz, local_path)
+    if not args.keep_preprocessed_npz:
+        temp_npz.unlink(missing_ok=True)
+
+
 def copy_gesture_file(
     args: argparse.Namespace,
     clip_id: str,
@@ -241,18 +358,11 @@ def copy_gesture_file(
         print(f"[SKIP] Local gesture exists: {local_path}")
         return
 
-    remote_src = remote_gesture_path(source, clip_id)
     if source.local_name == "ground_truth.npy":
-        temp_npz = clip_dir / f"{clip_id}.npz"
-        scp_from_remote(args, remote_src, temp_npz, required=True)
-        if args.dry_run:
-            print(f"[DRY-RUN] Would export ground truth from {temp_npz}")
-            return
-        export_ground_truth(temp_npz, local_path)
-        if not args.keep_preprocessed_npz:
-            temp_npz.unlink(missing_ok=True)
+        copy_ground_truth(args, clip_id, clip_dir)
         return
 
+    remote_src = remote_gesture_path(source, clip_id)
     scp_from_remote(args, remote_src, local_path, required=True)
 
 
@@ -324,6 +434,21 @@ def print_playback_commands(
         print(f"    {printable_command(command)}")
 
 
+def fetch_individual_assets(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
+    beat_root = args.remote_beat_root.rstrip("/")
+    scp_from_remote(args, remote_path(beat_root, "wave16k", f"{clip_id}.wav"), clip_dir / f"{clip_id}.wav")
+    scp_from_remote(
+        args,
+        remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid"),
+        clip_dir / f"{clip_id}.TextGrid",
+        required=not args.allow_missing_textgrid,
+    )
+    for source in GESTURE_SOURCES:
+        if source.local_name == "ground_truth.npy":
+            continue
+        copy_gesture_file(args, clip_id, source, clip_dir)
+
+
 def fetch_datapoint(args: argparse.Namespace, clip_id: str) -> tuple[Path, bool]:
     clip_dir = Path(args.output_dir) / clip_id
     if not args.dry_run:
@@ -333,26 +458,12 @@ def fetch_datapoint(args: argparse.Namespace, clip_id: str) -> tuple[Path, bool]
     print(f"[FETCH] Remote:    {args.remote}")
     print(f"[FETCH] Local dir: {clip_dir.resolve()}")
 
-    if not args.random and not args.dry_run and not remote_files_exist(args, clip_id):
-        missing = []
-        for label, remote_file in remote_asset_paths(args, clip_id).items():
-            missing.append(f"  {label}: {remote_file}")
-        raise FileNotFoundError(
-            "One or more required remote files are missing:\n" + "\n".join(missing)
-        )
+    if args.prefer_bundle and bundle_is_available(args, clip_id):
+        fetch_bundle_assets(args, clip_id, clip_dir)
+    else:
+        fetch_individual_assets(args, clip_id, clip_dir)
 
-    beat_root = args.remote_beat_root.rstrip("/")
-    scp_from_remote(args, remote_path(beat_root, "wave16k", f"{clip_id}.wav"), clip_dir / f"{clip_id}.wav")
-    scp_from_remote(
-        args,
-        remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid"),
-        clip_dir / f"{clip_id}.TextGrid",
-        required=not args.allow_missing_textgrid,
-    )
-
-    for source in GESTURE_SOURCES:
-        copy_gesture_file(args, clip_id, source, clip_dir)
-
+    copy_ground_truth(args, clip_id, clip_dir)
     write_manifest(args, clip_id, clip_dir)
     return clip_dir, not args.allow_missing_textgrid
 
@@ -372,26 +483,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--random",
         action="store_true",
-        help="Choose a random clip from the selected split with all remote assets present",
+        help=(
+            "Choose a random clip that already has all four model predictions on bitbucket "
+            "(discovered in a single SSH call)"
+        ),
     )
     parser.add_argument("--split", default="test", help="Split used with --random (default: test)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for --random")
-    parser.add_argument(
-        "--random-attempts",
-        type=int,
-        default=50,
-        help="How many random candidates to check before giving up",
-    )
-    parser.add_argument("--split-csv", default=None, help="Local train_test_split.csv path")
-    parser.add_argument(
-        "--remote-split-csv",
-        default=None,
-        help="Remote train_test_split.csv path (default: <remote-beat-root>/train_test_split.csv)",
-    )
-
     parser.add_argument("--remote", default=DEFAULT_REMOTE)
     parser.add_argument("--jump-host", default=DEFAULT_JUMP_HOST)
     parser.add_argument("--remote-beat-root", default=DEFAULT_REMOTE_BEAT)
+    parser.add_argument(
+        "--remote-bundle-dir",
+        default=DEFAULT_REMOTE_BUNDLE_DIR,
+        help=(
+            "Remote folder with pre-built per-clip bundles (wav, textgrid, four model .npy files). "
+            "Set to '' to disable bundle copy."
+        ),
+    )
+    parser.add_argument(
+        "--remote-preprocessed-dir",
+        default=DEFAULT_REMOTE_PREPROCESSED,
+        help="Remote BEAT2_NAO_Preprocessed root used for ground_truth.npy export",
+    )
+    parser.add_argument(
+        "--no-prefer-bundle",
+        dest="prefer_bundle",
+        action="store_false",
+        help="Copy wav/textgrid/predictions individually instead of using --remote-bundle-dir",
+    )
     parser.add_argument("--output-dir", default=DEFAULT_LOCAL_DIR)
     parser.add_argument("--server", default=DEFAULT_SERVER, help="NAO server URL for printed playback commands")
 
@@ -406,13 +526,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-ssh-reuse", action="store_true")
     parser.add_argument("--ssh-control-path", default=DEFAULT_SSH_CONTROL_PATH)
     parser.add_argument("--ssh-control-persist", default=DEFAULT_SSH_CONTROL_PERSIST)
+    parser.set_defaults(prefer_bundle=True)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.random_attempts <= 0:
-        raise ValueError("--random-attempts must be positive")
+    if not args.remote_bundle_dir:
+        args.prefer_bundle = False
 
     ensure_ssh_control_dir(args)
     clip_id = resolve_clip_id(args)
