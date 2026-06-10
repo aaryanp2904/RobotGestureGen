@@ -3,10 +3,11 @@
 
 Transfers, for one clip ID:
   - WAV and TextGrid sidecars
-  - ground_truth.npy (from preprocessed NAO angles)
+  - ground_truth.npy (from preprocessed NAO angles, or raw SMPL-X motion)
   - diffusion.npy, latent_diffusion.npy, transformers.npy, transformers_delta.npy
 
-Run from your local machine. Files are copied from the remote GPU host via SSH/scp.
+Run from your local machine. Files are staged on the remote host in one SSH call,
+then copied locally in one scp transfer.
 """
 
 from __future__ import annotations
@@ -19,12 +20,17 @@ import random
 import shlex
 import subprocess
 import sys
+import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from beat2_nao.fetch_nao_datapoint import load_motion_as_nao_angles  # noqa: E402
 
 from machine_learning.diffusion.remote_infer_pull import (  # noqa: E402
     DEFAULT_JUMP_HOST,
@@ -50,7 +56,7 @@ DEFAULT_SSH_CONTROL_PATH = "~/.ssh/robotgesturegen-%C"
 DEFAULT_SSH_CONTROL_PERSIST = "10m"
 DEFAULT_SERVER = "http://localhost:8000"
 
-_REMOTE_CLIP_CACHE: dict[tuple[str, str, str, str], dict[str, list[str]]] = {}
+_REMOTE_CLIP_CACHE: dict[tuple[str, str, str, str, str], dict[str, list[str]]] = {}
 
 
 @dataclass(frozen=True)
@@ -173,9 +179,16 @@ def remote_gesture_path(source: GestureSource, clip_id: str) -> str:
     return remote_path(source.remote_dir, f"{clip_id}.npy")
 
 
+def remote_motion_dir(args: argparse.Namespace) -> str:
+    if args.remote_motion_dir:
+        return args.remote_motion_dir.rstrip("/")
+    return remote_path(args.remote_beat_root, "smplxflame_30")
+
+
 def build_remote_list_script(args: argparse.Namespace) -> str:
     beat_root = args.remote_beat_root.rstrip("/")
     bundle_dir = (args.remote_bundle_dir or "").rstrip("/")
+    motion_dir = remote_motion_dir(args)
     return f"""import csv, json, os
 from pathlib import Path
 
@@ -183,6 +196,7 @@ bitbucket = Path({BITBUCKET_ROOT!r})
 beat = Path({beat_root!r})
 bundle_root = Path({bundle_dir!r})
 preprocessed = Path({args.remote_preprocessed_dir!r}) / "clips"
+motion = Path({motion_dir!r})
 pred_dirs = [
     bitbucket / "diffusion_predictions",
     bitbucket / "latent_diffusion_predictions",
@@ -190,18 +204,23 @@ pred_dirs = [
     bitbucket / "transformer_delta_predictions",
 ]
 
-def stems(directory):
+def stems(directory, suffix):
     if not directory.is_dir():
         return set()
-    return {{path.stem for path in directory.glob("*.npy")}}
+    return {{path.stem for path in directory.glob(f"*{{suffix}}")}}
 
 complete = None
 for directory in pred_dirs:
-    ids = stems(directory)
+    ids = stems(directory, ".npy")
     complete = ids if complete is None else complete & ids
 
+ground_truth_ids = set()
 if preprocessed.is_dir():
-    complete &= {{path.stem for path in preprocessed.glob("*.npz")}}
+    ground_truth_ids |= stems(preprocessed, ".npz")
+if motion.is_dir():
+    ground_truth_ids |= stems(motion, ".npz")
+if ground_truth_ids:
+    complete &= ground_truth_ids
 
 split = {args.split!r}
 if split:
@@ -244,6 +263,7 @@ def list_remote_clip_ids(args: argparse.Namespace) -> dict[str, list[str]]:
         args.split,
         args.remote_bundle_dir or "",
         args.remote_preprocessed_dir,
+        remote_motion_dir(args),
     )
     if cache_key in _REMOTE_CLIP_CACHE:
         return _REMOTE_CLIP_CACHE[cache_key]
@@ -297,7 +317,7 @@ def resolve_clip_id(args: argparse.Namespace) -> str:
     return Path(args.clip_id).stem
 
 
-def export_ground_truth(npz_path: Path, output_path: Path) -> None:
+def export_ground_truth_from_preprocessed(npz_path: Path, output_path: Path) -> None:
     data = np.load(str(npz_path), allow_pickle=True)
     if "nao_angles" not in data.files:
         raise ValueError(
@@ -307,7 +327,24 @@ def export_ground_truth(npz_path: Path, output_path: Path) -> None:
     if angles.ndim != 2 or angles.shape[1] != 10:
         raise ValueError(f"Expected ground-truth angles shaped (frames, 10), got {angles.shape}")
     np.save(output_path, angles)
-    print(f"[OUT] Ground truth: {output_path} ({angles.shape})")
+    print(f"[OUT] Ground truth from preprocessed angles: {output_path} ({angles.shape})")
+
+
+def export_ground_truth_from_motion(npz_path: Path, output_path: Path, clip_id: str) -> None:
+    conv_args = SimpleNamespace(
+        tag=clip_id,
+        no_velocity_limit=False,
+        start_frame=None,
+        start_time=None,
+        num_frames=None,
+        duration=None,
+    )
+    angles, metadata = load_motion_as_nao_angles(npz_path, conv_args)
+    np.save(output_path, angles)
+    print(
+        f"[OUT] Ground truth from {metadata['source_format']}: "
+        f"{output_path} ({angles.shape})"
+    )
 
 
 def remote_bundle_dir(args: argparse.Namespace, clip_id: str) -> str:
@@ -330,40 +367,118 @@ def fetch_bundle_assets(args: argparse.Namespace, clip_id: str, clip_dir: Path) 
     return True
 
 
-def copy_ground_truth(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
+def ensure_ground_truth_source(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
+    """Fetch a preprocessed or raw motion .npz when the bundle path omitted ground truth."""
+    if args.dry_run:
+        print(f"[DRY-RUN] Would fetch ground-truth source for {clip_id}")
+        return
+    if (clip_dir / f"{clip_id}.npz").is_file() or (clip_dir / "motion.npz").is_file():
+        return
+
+    preprocessed_npz = clip_dir / f"{clip_id}.npz"
+    motion_npz = clip_dir / "motion.npz"
+    remote_preprocessed = remote_path(args.remote_preprocessed_dir, "clips", f"{clip_id}.npz")
+    remote_motion = remote_path(remote_motion_dir(args), f"{clip_id}.npz")
+
+    # Try preprocessed first, then raw BEAT2 motion.
+    if scp_from_remote(args, remote_preprocessed, preprocessed_npz, required=False):
+        return
+    scp_from_remote(args, remote_motion, motion_npz, required=True)
+
+
+def finalize_ground_truth(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
     local_path = clip_dir / "ground_truth.npy"
     if local_path.is_file() and not args.overwrite:
         print(f"[SKIP] Local gesture exists: {local_path}")
         return
-
-    temp_npz = clip_dir / f"{clip_id}.npz"
-    remote_src = remote_path(args.remote_preprocessed_dir, "clips", f"{clip_id}.npz")
-    scp_from_remote(args, remote_src, temp_npz, required=True)
     if args.dry_run:
-        print(f"[DRY-RUN] Would export ground truth from {temp_npz}")
-        return
-    export_ground_truth(temp_npz, local_path)
-    if not args.keep_preprocessed_npz:
-        temp_npz.unlink(missing_ok=True)
-
-
-def copy_gesture_file(
-    args: argparse.Namespace,
-    clip_id: str,
-    source: GestureSource,
-    clip_dir: Path,
-) -> None:
-    local_path = clip_dir / source.local_name
-    if local_path.is_file() and not args.overwrite:
-        print(f"[SKIP] Local gesture exists: {local_path}")
+        print(f"[DRY-RUN] Would finalize ground truth at {local_path}")
         return
 
-    if source.local_name == "ground_truth.npy":
-        copy_ground_truth(args, clip_id, clip_dir)
-        return
+    preprocessed_npz = clip_dir / f"{clip_id}.npz"
+    motion_npz = clip_dir / "motion.npz"
+    if preprocessed_npz.is_file():
+        export_ground_truth_from_preprocessed(preprocessed_npz, local_path)
+        if not args.keep_preprocessed_npz:
+            preprocessed_npz.unlink(missing_ok=True)
+    elif motion_npz.is_file():
+        export_ground_truth_from_motion(motion_npz, local_path, clip_id)
+        if not args.keep_motion_npz:
+            motion_npz.unlink(missing_ok=True)
+    elif not local_path.is_file():
+        raise FileNotFoundError(
+            f"No ground-truth source arrived for {clip_id}. "
+            "Expected either a preprocessed .npz or raw motion.npz in the staged files."
+        )
 
-    remote_src = remote_gesture_path(source, clip_id)
-    scp_from_remote(args, remote_src, local_path, required=True)
+
+def build_remote_stage_script(args: argparse.Namespace, clip_id: str) -> str:
+    beat_root = args.remote_beat_root.rstrip("/")
+    motion_dir = remote_motion_dir(args)
+    preprocessed_npz = remote_path(args.remote_preprocessed_dir, "clips", f"{clip_id}.npz")
+    stage = f"/tmp/gesture_fetch_{clip_id}"
+    return textwrap.dedent(
+        f"""
+        import shutil
+        from pathlib import Path
+
+        clip_id = {clip_id!r}
+        stage = Path({stage!r})
+        if stage.exists():
+            shutil.rmtree(stage)
+        stage.mkdir(parents=True)
+
+        files = {{
+            "wav": Path({remote_path(beat_root, "wave16k", f"{clip_id}.wav")!r}),
+            "textgrid": Path({remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid")!r}),
+            "diffusion.npy": Path({remote_path(DIFFUSION_PRED_DIR, f"{clip_id}.npy")!r}),
+            "latent_diffusion.npy": Path({remote_path(LATENT_DIFFUSION_PRED_DIR, f"{clip_id}.npy")!r}),
+            "transformers.npy": Path({remote_path(TRANSFORMER_PRED_DIR, f"{clip_id}.npy")!r}),
+            "transformers_delta.npy": Path({remote_path(TRANSFORMER_DELTA_PRED_DIR, f"{clip_id}.npy")!r}),
+        }}
+
+        for name, src in files.items():
+            if not src.is_file():
+                raise FileNotFoundError(f"Missing remote asset: {{src}}")
+            dst = stage / (f"{{clip_id}}.wav" if name == "wav" else f"{{clip_id}}.TextGrid" if name == "textgrid" else name)
+            shutil.copy2(src, dst)
+
+        preprocessed = Path({preprocessed_npz!r})
+        motion = Path({remote_path(motion_dir, f"{clip_id}.npz")!r})
+        if preprocessed.is_file():
+            shutil.copy2(preprocessed, stage / f"{{clip_id}}.npz")
+        elif motion.is_file():
+            shutil.copy2(motion, stage / "motion.npz")
+        else:
+            raise FileNotFoundError(
+                "No ground-truth source found. Checked:\\n"
+                f"  {{preprocessed}}\\n"
+                f"  {{motion}}"
+            )
+
+        print(stage)
+        """
+    ).strip()
+
+
+def stage_remote_clip(args: argparse.Namespace, clip_id: str) -> str:
+    if args.dry_run:
+        print(f"[DRY-RUN] Would stage remote clip assets for {clip_id}")
+        return f"/tmp/gesture_fetch_{clip_id}"
+    script = build_remote_stage_script(args, clip_id)
+    quoted_script = shlex.quote(script)
+    result = run_ssh(args, f"python3 -c {quoted_script}")
+    stage_dir = result.stdout.strip().splitlines()[-1]
+    if not stage_dir:
+        raise RuntimeError("Remote staging did not return a stage directory path")
+    print(f"[REMOTE] Staged clip at {stage_dir}")
+    return stage_dir
+
+
+def cleanup_remote_stage(args: argparse.Namespace, stage_dir: str) -> None:
+    if args.dry_run or args.keep_remote_stage:
+        return
+    run_ssh(args, f"rm -rf {shlex.quote(stage_dir)}", required=False)
 
 
 def write_manifest(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
@@ -434,36 +549,30 @@ def print_playback_commands(
         print(f"    {printable_command(command)}")
 
 
-def fetch_individual_assets(args: argparse.Namespace, clip_id: str, clip_dir: Path) -> None:
-    beat_root = args.remote_beat_root.rstrip("/")
-    scp_from_remote(args, remote_path(beat_root, "wave16k", f"{clip_id}.wav"), clip_dir / f"{clip_id}.wav")
-    scp_from_remote(
-        args,
-        remote_path(beat_root, "textgrid", f"{clip_id}.TextGrid"),
-        clip_dir / f"{clip_id}.TextGrid",
-        required=not args.allow_missing_textgrid,
-    )
-    for source in GESTURE_SOURCES:
-        if source.local_name == "ground_truth.npy":
-            continue
-        copy_gesture_file(args, clip_id, source, clip_dir)
-
-
 def fetch_datapoint(args: argparse.Namespace, clip_id: str) -> tuple[Path, bool]:
     clip_dir = Path(args.output_dir) / clip_id
-    if not args.dry_run:
-        clip_dir.mkdir(parents=True, exist_ok=True)
+    if args.overwrite and clip_dir.exists() and not args.dry_run:
+        import shutil
+
+        shutil.rmtree(clip_dir)
 
     print(f"[FETCH] Clip:      {clip_id}")
     print(f"[FETCH] Remote:    {args.remote}")
     print(f"[FETCH] Local dir: {clip_dir.resolve()}")
 
-    if args.prefer_bundle and bundle_is_available(args, clip_id):
-        fetch_bundle_assets(args, clip_id, clip_dir)
-    else:
-        fetch_individual_assets(args, clip_id, clip_dir)
+    stage_dir = None
+    try:
+        if args.prefer_bundle and bundle_is_available(args, clip_id):
+            fetch_bundle_assets(args, clip_id, clip_dir)
+            ensure_ground_truth_source(args, clip_id, clip_dir)
+        else:
+            stage_dir = stage_remote_clip(args, clip_id)
+            scp_dir_from_remote(args, stage_dir, clip_dir)
+        finalize_ground_truth(args, clip_id, clip_dir)
+    finally:
+        if stage_dir:
+            cleanup_remote_stage(args, stage_dir)
 
-    copy_ground_truth(args, clip_id, clip_dir)
     write_manifest(args, clip_id, clip_dir)
     return clip_dir, not args.allow_missing_textgrid
 
@@ -507,6 +616,11 @@ def parse_args() -> argparse.Namespace:
         help="Remote BEAT2_NAO_Preprocessed root used for ground_truth.npy export",
     )
     parser.add_argument(
+        "--remote-motion-dir",
+        default=None,
+        help="Remote SMPL-X motion directory (default: <remote-beat-root>/smplxflame_30)",
+    )
+    parser.add_argument(
         "--no-prefer-bundle",
         dest="prefer_bundle",
         action="store_false",
@@ -521,6 +635,16 @@ def parse_args() -> argparse.Namespace:
         "--keep-preprocessed-npz",
         action="store_true",
         help="Keep the temporary preprocessed .npz after exporting ground_truth.npy",
+    )
+    parser.add_argument(
+        "--keep-motion-npz",
+        action="store_true",
+        help="Keep the temporary raw motion.npz after exporting ground_truth.npy",
+    )
+    parser.add_argument(
+        "--keep-remote-stage",
+        action="store_true",
+        help="Do not delete the temporary staging directory on the remote host",
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-ssh-reuse", action="store_true")
