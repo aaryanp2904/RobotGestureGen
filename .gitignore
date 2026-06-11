@@ -59,3 +59,4 @@ normalization_stats.json
 *.bvh
 *.wav
 *.mp3
+gesture_datapoints/*
