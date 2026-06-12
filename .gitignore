@@ -1,0 +1,62 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# IDE and OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and runtime output
+*.log
+logs/
+tmp/
+temp/
+
+# Local datasets and preprocessed corpora
+data/
+datasets/
+PreprocessedGenea/
+BEAT2/
+BEAT2_cleaned/
+BEAT2_NAO_Preprocessed/
+*.lmdb/
+*.mdb
+
+# Generated ML artifacts
+checkpoints/
+runs/
+wandb/
+outputs/
+*.ckpt
+*.pt
+*.pth
+*.npy
+*.npz
+predictions*.npy
+evaluation_report*.json
+normalization_stats.json
+
+# Large motion/audio exports
+*.bvh
+*.wav
+*.mp3
+gesture_datapoints/*

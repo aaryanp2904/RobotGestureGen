@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train the BEAT2/NAO GestureTransformer on preprocessed LMDB windows."""
+"""Train the BEAT2/NAO GestureTransformer on preprocessed delta LMDB windows."""
 
 from __future__ import annotations
 
@@ -54,7 +54,7 @@ class PreprocessedLMDBDataset(Dataset):
             "[DATASET] "
             f"input_dim={self.metadata['input_dim']} "
             f"target_shape={self.metadata['target_shape']} "
-            f"target_mode={self.metadata.get('target_mode', 'angle')}"
+            f"target_mode={self.metadata.get('target_mode', 'delta')}"
         )
 
     def _get_env(self):
@@ -99,12 +99,12 @@ class PreprocessedLMDBDataset(Dataset):
 
 
 def validate_transformer_metadata(metadata: dict, source: str) -> None:
-    """Ensure the LMDB matches this energy-free transformer pipeline."""
+    """Ensure the LMDB matches this energy-free delta-transformer pipeline."""
     gesture_energy_dim = int(metadata.get("gesture_energy_dim", 0) or 0)
     if gesture_energy_dim != 0:
         raise ValueError(
             f"{source} has gesture_energy_dim={gesture_energy_dim}; "
-            "rerun machine_learning.transformers.preprocessing so transformer "
+            "rerun machine_learning.transformers_delta.preprocessing so delta-transformer "
             "training uses prosody + WavLM (+ optional text) only."
         )
     input_dim = int(metadata.get("input_dim", 0) or 0)
@@ -121,6 +121,12 @@ def validate_transformer_metadata(metadata: dict, source: str) -> None:
     target_shape = tuple(metadata.get("target_shape", ()))
     if len(target_shape) != 1 or int(target_shape[0]) <= 0:
         raise ValueError(f"{source} target_shape must be a 1-D NAO angle shape, got {target_shape}")
+    target_mode = metadata.get("target_mode")
+    if target_mode != "delta":
+        raise ValueError(
+            f"{source} target_mode={target_mode!r}; transformers_delta expects per-frame deltas. "
+            "Rerun machine_learning.transformers_delta.preprocessing."
+        )
 
 
 def important_metadata(metadata: dict) -> dict:
@@ -160,9 +166,9 @@ def build_model_config(metadata: dict, args: argparse.Namespace) -> dict:
         "num_layers": args.num_layers,
         "dropout": args.dropout,
         "target_shape": tuple(metadata["target_shape"]),
-        "target_mode": metadata.get("target_mode", "angle"),
-        "target_representation": metadata.get("target_representation", "nao_angles"),
-        "target_type": metadata.get("target_type", "nao_joint_angles"),
+        "target_mode": metadata.get("target_mode", "delta"),
+        "target_representation": metadata.get("target_representation", "nao_joint_deltas"),
+        "target_type": metadata.get("target_type", "nao_joint_deltas"),
         "nao_std": metadata.get("nao_std"),
         "nao_vel_mean": metadata.get("nao_vel_mean"),
         "nao_vel_std": metadata.get("nao_vel_std"),
@@ -188,7 +194,7 @@ class MotionLoss(nn.Module):
         velocity_weight: float = 0.0,
         acceleration_weight: float = 0.0,
         velocity_target_weight: float = 0.0,
-        target_mode: str = "angle",
+        target_mode: str = "delta",
         angle_std=None,
         vel_mean=None,
         vel_std=None,
@@ -393,6 +399,18 @@ def train(args: argparse.Namespace) -> None:
         validate_metadata_match(train_dataset.metadata, val_dataset.metadata)
 
     model_config = build_model_config(train_dataset.metadata, args)
+    if model_config.get("target_mode") == "delta" and any(
+        weight > 0
+        for weight in (
+            args.velocity_loss_weight,
+            args.acceleration_loss_weight,
+            args.velocity_target_loss_weight,
+        )
+    ):
+        raise ValueError(
+            "The copied temporal loss flags operate on absolute angle targets and are disabled "
+            "for transformers_delta. Leave velocity/acceleration loss weights at 0."
+        )
     if args.velocity_target_loss_weight > 0 and any(
         model_config.get(key) is None for key in ("nao_std", "nao_vel_mean", "nao_vel_std")
     ):
@@ -422,7 +440,7 @@ def train(args: argparse.Namespace) -> None:
         velocity_weight=args.velocity_loss_weight,
         acceleration_weight=args.acceleration_loss_weight,
         velocity_target_weight=args.velocity_target_loss_weight,
-        target_mode=model_config.get("target_mode", "angle"),
+        target_mode=model_config.get("target_mode", "delta"),
         angle_std=model_config.get("nao_std"),
         vel_mean=model_config.get("nao_vel_mean"),
         vel_std=model_config.get("nao_vel_std"),
@@ -500,7 +518,7 @@ def train(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train GestureTransformer on BEAT2 LMDB windows")
+    parser = argparse.ArgumentParser(description="Train GestureTransformer on BEAT2 delta LMDB windows")
     parser.add_argument("--data-dir", required=True, help="Path to train.lmdb")
     parser.add_argument("--val-data-dir", default=None, help="Optional path to val.lmdb")
     parser.add_argument("--output-dir", required=True, help="Directory for checkpoints")

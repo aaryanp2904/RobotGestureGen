@@ -58,8 +58,8 @@ def cross(a, b):
 def dot(a, b):
     return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
 
-def bvh_to_nao_space(v):
-    """BVH (X=Left, Y=Up, Z=Forward) → NAO (X=Fwd, Y=Left, Z=Up)."""
+def mocap_to_nao_space(v):
+    """Motion-capture (X=Left, Y=Up, Z=Forward) → NAO (X=Fwd, Y=Left, Z=Up)."""
     return [v[2], v[0], v[1]]
 
 # --- Arm IK (reused from main_ik_client.py) ---
@@ -122,14 +122,14 @@ def positions_to_nao_angles(p):
     v_upper_r = [p[6][i] - p[5][i] for i in range(3)]   # forearm - arm
     v_lower_r = [p[7][i] - p[6][i] for i in range(3)]   # wrist - forearm
     r_p, r_r, r_y, r_er = solve_nao_arm_ik(
-        bvh_to_nao_space(v_upper_r), bvh_to_nao_space(v_lower_r), is_left=False
+        mocap_to_nao_space(v_upper_r), mocap_to_nao_space(v_lower_r), is_left=False
     )
 
     # --- LEFT ARM ---
     v_upper_l = [p[10][i] - p[9][i] for i in range(3)]  # forearm - arm
     v_lower_l = [p[11][i] - p[10][i] for i in range(3)] # wrist - forearm
     l_p, l_r, l_y, l_er = solve_nao_arm_ik(
-        bvh_to_nao_space(v_upper_l), bvh_to_nao_space(v_lower_l), is_left=True
+        mocap_to_nao_space(v_upper_l), mocap_to_nao_space(v_lower_l), is_left=True
     )
 
     return {
